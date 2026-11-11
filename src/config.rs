@@ -37,6 +37,11 @@ pub struct Config {
     /// profile field (the price-bucketed 46-name catalogue; level presets
     /// in `Fleet_CreateRandomEscadraForSlot`).
     pub skirmish: PoolConfig,
+    /// Tarkhan ships for hire / event reinforcements. `addReinforceingShips`
+    /// rolls one design name per call from a tier table; tier 1 serves the
+    /// city ASK_REINFORCE dialog, tier 0 the event/script path, tier 2 has no
+    /// live caller in 1.163. The `extras_*` fields do not apply here.
+    pub tarkhans: TarkhansConfig,
 }
 
 impl Default for Config {
@@ -48,6 +53,7 @@ impl Default for Config {
             tactical_missile: PoolConfig::default(),
             garrisons: GarrisonsConfig::default(),
             skirmish: PoolConfig::default(),
+            tarkhans: TarkhansConfig::default(),
         }
     }
 }
@@ -60,6 +66,21 @@ pub struct GarrisonsConfig {
     pub campaign: PoolConfig,
     /// Endgame city garrisons (`somethingSpawnShips` pool 4).
     pub endgame: PoolConfig,
+}
+
+/// The three tier tables of `addReinforceingShips`; one ship name is rolled
+/// from the chosen tier per call (two copies of the same roll for tier 2).
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct TarkhansConfig {
+    /// Event/script path (`creatureLogic`): Navarin, Scarab, Meteor Mk3,
+    /// Fatman, Lightning Mk2.
+    pub tier0: PoolConfig,
+    /// City ASK_REINFORCE dialog: Navarin, Intrepid, Jaguar, Voskhod X2,
+    /// Triumphant, Longbow, Vega, Kormoran.
+    pub tier1: PoolConfig,
+    /// Same eight names as tier 1 (no live caller found in 1.163).
+    pub tier2: PoolConfig,
 }
 
 #[derive(Deserialize, Serialize, Default)]

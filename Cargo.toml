@@ -1,6 +1,6 @@
 [package]
 name = "hf-hee"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Highfleet Escadra Editor (HEE): config-driven edits to every hard-coded enemy ship pool (strike groups, tactical groups, garrisons, general enemies). Steam 1.163."
 

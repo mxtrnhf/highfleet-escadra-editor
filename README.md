@@ -42,6 +42,7 @@ behavior.
 | `garrisons.campaign` | pool id 0: the campaign-start fleets — settlement garrisons of the six generated towns, the Khiva quest fleet, and the tarkhan/event escadras linked into the event records (`+0x2b8`, strength `+0x248`). |
 | `garrisons.endgame` | pool id 4 (city garrisons spawned by the endgame collapse). |
 | `skirmish` | `Fleet_GenerateShipNames` `0x205ae0` — the 46-name, five-price-bucket catalogue behind the **skirmish escadras**: the escalating random fleets driven by the profile field `nextSkirmishEscadraLevel` (level presets in `Fleet_CreateRandomEscadraForSlot` `0x1c2ba0`, first fleet at level 1 at campaign start, level +1 per spawn). |
+| `tarkhans.tier0/1/2` | `addReinforceingShips` `0x21b8c0` — the tables the game rolls one ship name from per call: **tier 0** the event/script path (`creatureLogic`), **tier 1** the city ASK_REINFORCE dialog (`Dialog_ExecuteChoiceActions`), **tier 2** an unused copy of the tier-1 list. The chosen ship is instantiated as a `NEW_SHIP` appended to the player's escadra, so these are the tarkhan/mercenary ships that come to your side. `extras_*` do not apply here — per-tier `add`/`remove` only. |
 
 Terminology check (2026-11-12): the engine itself names the bucket-pool fleets
 "skirmish escadras" (`nextSkirmishEscadraLevel`, serialized in the profile) —
@@ -75,6 +76,10 @@ not covered.
   Gladiator, Gladiator MRL, Gepard, Intrepid Mk3, Paladin Mk2, Paladin,
   Gladiator LANCE, Longbow, Kormoran, Archangel, Negev, Borey, Novorossiysk,
   Nomad, Nomad Mk2, Sevastopol
+* **tarkhans.tier0** (event path): Navarin, Scarab, Meteor Mk3, Fatman,
+  Lightning Mk2
+* **tarkhans.tier1/2** (city dialog; tier 2 is the same list twice): Navarin,
+  Intrepid, Jaguar, Voskhod X2, Triumphant, Longbow, Vega, Kormoran
 
 ## Build and install
 

@@ -38,5 +38,19 @@
     "remove": [],
     "extras_add": [],
     "extras_remove": []
+  },
+  "tarkhans": {
+    "tier0": {
+      "add": [],
+      "remove": []
+    },
+    "tier1": {
+      "add": [],
+      "remove": []
+    },
+    "tier2": {
+      "add": [],
+      "remove": []
+    }
   }
 }

@@ -33,6 +33,10 @@ pub const GENERATE_SHIP_NAMES_FN: usize = 0x205ae0;
 /// (`nextSkirmishEscadraLevel`, serialized), initialized to 1 and stepped
 /// once per skirmish escadra.
 pub const SKIRMISH_FOR_SLOT_FN: usize = 0x1c2ba0;
+/// `addReinforceingShips` (`0x21b8c0`): the tarkhan for-hire / event
+/// reinforcement tables. Callers: `Dialog_ExecuteChoiceActions`
+/// (`ASK_REINFORCE`, tier 1) and `creatureLogic` (event/script path, tier 0).
+pub const ADD_REINFORCING_SHIPS_FN: usize = 0x21b8c0;
 
 /// `Prologue_SpawnEventGroups` (`0x2a7f60`): group-6 tarkhan/NPC fleets use
 /// `somethingSpawnShips` pool 2. Both tactical specializations share it.
@@ -175,6 +179,25 @@ pub const VANILLA_SKIRMISH: &[&str] = &[
     "Sevastopol",
 ];
 
+/// Tarkhan event reinforcements (`addReinforceingShips` tier 0, rolled by
+/// `HGE_RandInt(0,4)`).
+pub const VANILLA_TARKHANS_TIER0: &[&str] =
+    &["Navarin", "Scarab", "Meteor Mk3", "Fatman", "Lightning Mk2"];
+/// Tarkhan ships for hire at a city (`addReinforceingShips` tier 1, rolled by
+/// `HGE_RandInt(0,7)`).
+pub const VANILLA_TARKHANS_TIER1: &[&str] = &[
+    "Navarin",
+    "Intrepid",
+    "Jaguar",
+    "Voskhod X2",
+    "Triumphant",
+    "Longbow",
+    "Vega",
+    "Kormoran",
+];
+/// Tier 2 uses the tier-1 list twice; no live caller found in 1.163.
+pub const VANILLA_TARKHANS_TIER2: &[&str] = VANILLA_TARKHANS_TIER1;
+
 /// Log one line per config category: what `escadra.json` asks for and which
 /// code path it will be applied to. Until the hooks exist this is the only
 /// effect of the config.
@@ -203,5 +226,11 @@ pub fn log_summary(config: &Config) {
     log::info!(
         "HEE skirmish         @ {GENERATE_SHIP_NAMES_FN:#x} / {SKIRMISH_FOR_SLOT_FN:#x}: {}",
         config.skirmish.summary()
+    );
+    log::info!(
+        "HEE tarkhan tier0/1/2 @ {ADD_REINFORCING_SHIPS_FN:#x}: {} / {} / {}",
+        config.tarkhans.tier0.summary(),
+        config.tarkhans.tier1.summary(),
+        config.tarkhans.tier2.summary()
     );
 }
