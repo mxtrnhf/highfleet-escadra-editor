@@ -19,17 +19,26 @@ use crate::config::Config;
 
 /// `Endgame_BuildEscadra` (`0x2077c0`): the Strike Group composer.
 pub const STRIKEGROUPS_FN: usize = 0x2077c0;
-/// `somethingSpawnShips` (`0x203b80`): strength-table pools for garrisons
-/// and event fleets; the pool is its `R8D` argument.
+/// `somethingSpawnShips` (`0x203b80`): strength-table pools; the pool is its
+/// `R8D` argument. Pool 0 backs the campaign-start settlement garrisons,
+/// the Khiva quest fleet and the tarkhan/event escadras linked into the
+/// event records (`record+0x2b8`, strength `+0x248`); pool 2 backs the
+/// group-6 tarkhan/NPC fleets; pool 4 backs the endgame garrisons.
 pub const SPAWN_SHIPS_FN: usize = 0x203b80;
-/// `Fleet_GenerateShipNames` (`0x205ae0`): the 46-name price-bucket catalogue
-/// for general enemies.
+/// `Fleet_GenerateShipNames` (`0x205ae0`): the 46-name price-bucket
+/// catalogue for the skirmish escadras.
 pub const GENERATE_SHIP_NAMES_FN: usize = 0x205ae0;
+/// `Fleet_CreateRandomEscadraForSlot` (`0x1c2ba0`): the level presets of the
+/// skirmish ladder; the slot id comes from `Profile+0x5dc`
+/// (`nextSkirmishEscadraLevel`, serialized), initialized to 1 and stepped
+/// once per skirmish escadra.
+pub const SKIRMISH_FOR_SLOT_FN: usize = 0x1c2ba0;
 
-/// `Prologue_SpawnEventGroups` (`0x2a7f60`): group-6 event fleets use
+/// `Prologue_SpawnEventGroups` (`0x2a7f60`): group-6 tarkhan/NPC fleets use
 /// `somethingSpawnShips` pool 2. Both tactical specializations share it.
 pub const TACTICAL_POOL_ID: u32 = 2;
-/// Pool 0: campaign garrisons and scripted event escadras.
+/// Pool 0: campaign-start settlement garrisons, the Khiva quest fleet and
+/// the tarkhan/event escadras.
 pub const GARRISON_CAMPAIGN_POOL_ID: u32 = 0;
 /// Pool 4: endgame city garrisons.
 pub const GARRISON_ENDGAME_POOL_ID: u32 = 4;
@@ -116,10 +125,11 @@ pub const VANILLA_STRIKEGROUPS_FLAGGED: &[&str] = &["Nomad Mk2", "Nomad", "Gryph
 /// Strike Group post-roll specials.
 pub const VANILLA_STRIKEGROUPS_EXTRAS: &[&str] = &["Tarantul ARM", "Wasp", "Longbow", "Typhon"];
 
-/// The general-enemy catalogue: 46 pushes (Fearsome appears twice in the
-/// code; de-duplicated here) fed through `Fleet_AddNamedShipToPool` and
-/// filtered into five price buckets (<=15 / <=25 / <=40 / <=75 / >75).
-pub const VANILLA_GENERAL_ENEMIES: &[&str] = &[
+/// The skirmish catalogue: 46 pushes (Fearsome appears twice in the code;
+/// de-duplicated here) fed through `Fleet_AddNamedShipToPool` and filtered
+/// into five price buckets (<=15 / <=25 / <=40 / <=75 / >75). The level
+/// presets that draw from it live in `Fleet_CreateRandomEscadraForSlot`.
+pub const VANILLA_SKIRMISH: &[&str] = &[
     "Courageous",
     "Meteor Mk2",
     "Rook",
@@ -191,7 +201,7 @@ pub fn log_summary(config: &Config) {
         config.garrisons.endgame.summary()
     );
     log::info!(
-        "HEE general enemies @ {GENERATE_SHIP_NAMES_FN:#x}: {}",
-        config.general_enemies.summary()
+        "HEE skirmish         @ {GENERATE_SHIP_NAMES_FN:#x} / {SKIRMISH_FOR_SLOT_FN:#x}: {}",
+        config.skirmish.summary()
     );
 }

@@ -33,7 +33,7 @@
       "extras_remove": []
     }
   },
-  "general_enemies": {
+  "skirmish": {
     "add": [],
     "remove": [],
     "extras_add": [],

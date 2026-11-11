@@ -27,13 +27,16 @@ pub struct Config {
     /// Tactical groups, missile specialization. The `Longbow` / `'Tarantul
     /// MRL'` extras land here.
     pub tactical_missile: PoolConfig,
-    /// City garrisons. Two code paths, both editable:
-    /// `campaign` (fleet present from campaign start) and `endgame` (the
-    /// garrison ships spawned by the endgame collapse).
+    /// City garrisons. Two code paths, both editable: `campaign` (the
+    /// settlement garrisons and quest/event fleets linked at campaign
+    /// start, incl. the Khiva defense force) and `endgame` (the garrison
+    /// ships spawned by the endgame collapse).
     pub garrisons: GarrisonsConfig,
-    /// General enemies: the price-bucketed 46-name catalogue behind the
-    /// scenario / escalating response fleets.
-    pub general_enemies: PoolConfig,
+    /// Skirmish escadras: the escalating random fleets the Duchy commits
+    /// during the campaign, driven by the `nextSkirmishEscadraLevel`
+    /// profile field (the price-bucketed 46-name catalogue; level presets
+    /// in `Fleet_CreateRandomEscadraForSlot`).
+    pub skirmish: PoolConfig,
 }
 
 impl Default for Config {
@@ -44,7 +47,7 @@ impl Default for Config {
             tactical_air: PoolConfig::default(),
             tactical_missile: PoolConfig::default(),
             garrisons: GarrisonsConfig::default(),
-            general_enemies: PoolConfig::default(),
+            skirmish: PoolConfig::default(),
         }
     }
 }

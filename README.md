@@ -38,10 +38,14 @@ behavior.
 | Category | Game code (RVA, image base `0x140000000`) |
 |---|---|
 | `strikegroups` | `Endgame_BuildEscadra` `0x2077c0` — the roaming big fleets (campaign-start ring + endgame waves). Extras: `Tarantul ARM`, `Wasp`/`Longbow`, `Typhon`. |
-| `tactical_air` / `tactical_missile` | `somethingSpawnShips` `0x203b80`, pool id 2 (from `Prologue_SpawnEventGroups` `0x2a7f60`, group 6). Both specializations share one base pool: `add` lists merge, `remove` lists union. `Eagle` is the air extra; `Longbow`/`Tarantul MRL` the missile extras. |
-| `garrisons.campaign` | pool id 0 (campaign garrisons + scripted event escadras, via `Prologue_SpawnEventEscadra` `0x2038e0`). |
+| `tactical_air` / `tactical_missile` | `somethingSpawnShips` `0x203b80`, pool id 2 (from `Prologue_SpawnEventGroups` `0x2a7f60`, group 6): the **tarkhan/NPC fleets** — the escadra is created together with its tarkhan NPC record. Both specializations share one base pool: `add` lists merge, `remove` lists union. `Eagle` is the air extra; `Longbow`/`Tarantul MRL` the missile extras. |
+| `garrisons.campaign` | pool id 0: the campaign-start fleets — settlement garrisons of the six generated towns, the Khiva quest fleet, and the tarkhan/event escadras linked into the event records (`+0x2b8`, strength `+0x248`). |
 | `garrisons.endgame` | pool id 4 (city garrisons spawned by the endgame collapse). |
-| `general_enemies` | `Fleet_GenerateShipNames` `0x205ae0` — the 46-name, five-price-bucket catalogue behind the scenario and escalating response fleets (`Fleet_CreateRandomEscadra`/`...ForSlot`). |
+| `skirmish` | `Fleet_GenerateShipNames` `0x205ae0` — the 46-name, five-price-bucket catalogue behind the **skirmish escadras**: the escalating random fleets driven by the profile field `nextSkirmishEscadraLevel` (level presets in `Fleet_CreateRandomEscadraForSlot` `0x1c2ba0`, first fleet at level 1 at campaign start, level +1 per spawn). |
+
+Terminology check (2026-11-12): the engine itself names the bucket-pool fleets
+"skirmish escadras" (`nextSkirmishEscadraLevel`, serialized in the profile) —
+they are the escalating hunting forces, *not* city garrisons.
 
 Notes: pools 1 and 3 of `somethingSpawnShips` have no live call site in
 1.163 and are not configurable. Trade convoys are a separate path
@@ -63,7 +67,7 @@ not covered.
 * **strikegroups**: Borey (seeded twice), Kormoran, Negev; flagged designs
   Nomad Mk2, Nomad, Gryphon (twice); extras Tarantul ARM, Wasp, Longbow,
   Typhon
-* **general_enemies** (46 entries, two duplicate Fearsome pushes
+* **skirmish** (46 entries, two duplicate Fearsome pushes
   de-duplicated): Courageous, Meteor Mk2, Rook, Meteor Mk3, Slogger,
   Lightning, Talos, Navarin Mk2, Flower, Navarin, Fenek, Ballistic,
   Lightning Mk2, Navarin Mk3, Intrepid, Fatman, Fury, Scarab, Lancer, Sarma,
