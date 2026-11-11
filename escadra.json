@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "enabled": true,
+  "strikegroups": {
+    "add": [],
+    "remove": [],
+    "extras_add": [],
+    "extras_remove": []
+  },
+  "tactical_air": {
+    "add": [],
+    "remove": [],
+    "extras_add": [],
+    "extras_remove": []
+  },
+  "tactical_missile": {
+    "add": [],
+    "remove": [],
+    "extras_add": [],
+    "extras_remove": []
+  },
+  "garrisons": {
+    "campaign": {
+      "add": [],
+      "remove": [],
+      "extras_add": [],
+      "extras_remove": []
+    },
+    "endgame": {
+      "add": [],
+      "remove": [],
+      "extras_add": [],
+      "extras_remove": []
+    }
+  },
+  "general_enemies": {
+    "add": [],
+    "remove": [],
+    "extras_add": [],
+    "extras_remove": []
+  }
+}
