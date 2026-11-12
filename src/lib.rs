@@ -1,25 +1,30 @@
 //! Highfleet Escadra Editor (HEE). Steam 1.163 only.
 //!
-//! Every enemy ship pool in the game is hard-coded inline in the executable
-//! (no data files): strike groups, tactical groups, city garrisons and the
-//! general-enemy catalogue. HEE makes them editable from one config file,
-//! `Modloader/config/escadra.json`, so ships can be added to or removed from
-//! a pool without rebuilding anything. Evidence and addresses:
-//! `hf_notes/docs/findings/strategy/enemy-ship-pools.md`.
+//! Every ship spawn pool in HighFleet is hard-coded inline in `.text` (no data
+//! files): Strike Groups, Aircraft and Missile Tactical Groups, City Garrisons,
+//! Tarkhan personal/finale ships, Mercenary city pier offers, Tarkhan call-in
+//! reinforcements, Trade Convoys, and Shipworks `TEST` combat. HEE exposes them
+//! in one config file, `Modloader/config/escadra.json`, and installs byte-guarded
+//! native detours only for the pools modified in the config.
 //!
-//! v0.1.0 is a scaffold: it loads/creates the config, logs one summary line
-//! per pool and changes nothing in game. The detours that apply the edits
-//! land in the next version.
+//! Supporting reverse-engineering notes:
+//! - `hf_notes/docs/findings/strategy/enemy-ship-pools.md`
+//! - `hf_notes/docs/findings/strategy/mercenary-ships.md`
 
 highfleet_mod_api::export_logger!();
 
 mod config;
+mod hooks;
+mod native;
+mod pool_math;
 mod pools;
 
 use std::ffi::c_char;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
+
+use crate::pool_math::ResolvedPools;
 
 const IMAGE_BASE: usize = 0x1_4000_0000;
 const CONFIG_PATH: &str = "Modloader/config/escadra.json";
@@ -50,7 +55,19 @@ unsafe extern "C" fn init() -> bool {
         log::info!("hf_hee: disabled in {CONFIG_PATH}");
         return true;
     }
+
     pools::log_summary(&config);
-    log::info!("hf_hee: v0.1.0 is scaffold-only; no pools are modified yet");
-    true
+    let resolved = ResolvedPools::from_config(&config);
+
+    match hooks::install(resolved) {
+        Ok(0) => true,
+        Ok(count) => {
+            log::info!("hf_hee: active ({count} pool detour(s) installed)");
+            true
+        }
+        Err(error) => {
+            log::error!("hf_hee: failed to install detours: {error}");
+            false
+        }
+    }
 }

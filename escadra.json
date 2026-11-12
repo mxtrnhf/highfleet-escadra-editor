@@ -1,56 +1,36 @@
 {
-  "version": 1,
+  "version": 3,
   "enabled": true,
   "strikegroups": {
-    "add": [],
     "remove": [],
-    "extras_add": [],
-    "extras_remove": []
+    "add": []
   },
   "tactical_air": {
-    "add": [],
     "remove": [],
-    "extras_add": [],
-    "extras_remove": []
+    "add": []
   },
   "tactical_missile": {
-    "add": [],
     "remove": [],
-    "extras_add": [],
-    "extras_remove": []
+    "add": []
   },
   "garrisons": {
-    "campaign": {
-      "add": [],
-      "remove": [],
-      "extras_add": [],
-      "extras_remove": []
-    },
-    "endgame": {
-      "add": [],
-      "remove": [],
-      "extras_add": [],
-      "extras_remove": []
-    }
-  },
-  "skirmish": {
-    "add": [],
     "remove": [],
-    "extras_add": [],
-    "extras_remove": []
+    "add": []
   },
   "tarkhans": {
-    "tier0": {
-      "add": [],
-      "remove": []
-    },
-    "tier1": {
-      "add": [],
-      "remove": []
-    },
-    "tier2": {
-      "add": [],
-      "remove": []
-    }
+    "remove": [],
+    "add": []
+  },
+  "mercs": {
+    "remove": [],
+    "add": []
+  },
+  "traders": {
+    "remove": [],
+    "add": []
+  },
+  "shipworks": {
+    "remove": [],
+    "add": []
   }
 }
