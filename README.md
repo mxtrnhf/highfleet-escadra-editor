@@ -17,8 +17,8 @@ Reverse-engineering evidence and exact call-site proofs:
    * `"add": ["MyCruiser"]` — adds to the vanilla pool (listing a ship twice
      doubles its draw weight).
    * `"remove": ["Slogger"]` — removes matching ships from the vanilla pool.
-   * `"replace": ["MyCruiser", "Gladiator"]` *(optional)* — replaces the vanilla
-     pool outright with your exact list.
+   * `"replace": ["MyCruiser", "Gladiator"]` *(optional)* — replaces the **entire
+     vanilla pool** with your exact list, not one individual ship with another.
 
 ```json
 {
@@ -129,6 +129,29 @@ you want finer control. When a sub-field is omitted, the category's top-level
 }
 ```
 
+### Example: `replace` replaces a whole pool, not individual ships
+
+This config fragment discards the vanilla campaign garrison pool and uses only
+`MyCorvette` and `MyCruiser` as its base ship choices:
+
+```json
+{
+  "garrisons": {
+    "campaign": { "replace": ["MyCorvette", "MyCruiser"] }
+  }
+}
+```
+
+The array is **not an old-ship/new-ship pair**. Both names are choices in the
+new pool. It also does not mean every garrison contains exactly those two ships:
+the game still rolls ships from the pool according to its spawning rules.
+`replace` applies first, then `remove`, then `add`; inside a sub-pool, it replaces
+that sub-pool only.
+
+To swap one design while keeping the other vanilla choices, use `remove` and
+`add` instead: `"campaign": { "remove": ["Courageous"], "add": ["MyCorvette"] }`.
+These settings affect future spawns, not ships already present in a save.
+
 ## Optional `count` field (how many groups exist in total)
 
 Four categories take an extra optional string field, `count`, that adjusts **how
@@ -234,6 +257,13 @@ their own garrison city), so no sprinkle flag exists for them.
 * **v0.5.1 sprinkle — validated in game** (Steam 1.163, hf_hee v0.5.1,
   `strikegroups.count` `*10`, sprinkle default-on): strike groups spawn spread
   across cities instead of stacked.
+* **v0.5.2 zero counts — verified in a new campaign save** (Steam 1.163,
+  `Saves/Profile_1/profile.seria`, saved 2026-11-13 11:34): with `count: "0"`
+  on strike groups, tactical air, tactical missile, and traders, the scanner
+  found 95 garrisons and the player fleet, with no role-1/3/4/5/6 groups.
+  Garrison ship lists contained only the 13 vanilla base designs, with no
+  tactical carrier packages. The 11:33:18 startup log confirms v0.5.2 loaded
+  and installed all 8 patches, including the campaign loop-entry skip.
 * Not yet covered: the endgame Khiva-assault (`role 6`) and outer Nuclear War
   wave count hooks fire only when the endgame triggers.
 
