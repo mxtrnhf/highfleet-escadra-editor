@@ -213,11 +213,28 @@ their own garrison city), so no sprinkle flag exists for them.
   * Added `traders` category (`spawnTradeConvoy?` `0x140208660` for convoy escorts and prize trade ships, including automatic `m_prize` capture tagging on custom trader hulls).
   * Added optional nuanced sub-fields across all categories (`tarkhans.tier0..tier4`, `strikegroups.missile_escorts`, `garrisons.campaign`/`endgame`, `mercs.hire`/`endgame`/`reinforcements`, `traders.ships`/`escorts`/`escorts_hard`, `shipworks.small`/`mid`/`large`/`carrier`) while keeping the flat JSON structure fully supported.
 
+## Validation
+
+* **v0.4.0 counts — verified in a real save** (`Saves/Profile_1/profile.seria`,
+  Steam 1.163, saved 2026-11-13 with `"count": "*50"` on `traders` and
+  `strikegroups`): the save contains exactly **1500 role-1 trade convoys**
+  (vanilla 30 × 50) and **300 role-5 strike groups** (vanilla 6 × 50).
+  Scan a save with [`../hf_dev_tools/save_scan.py`](../hf_dev_tools/README.md).
+* **v0.4.0 clustering — verified in the same save**: without sprinkle, 295 of
+  the 300 SGs sat at one city (`ISA`); convoys already spread (853 distinct
+  positions over 1500).
+* **v0.5.1 sprinkle — validated in game** (Steam 1.163, hf_hee v0.5.1,
+  `strikegroups.count` `*10`, sprinkle default-on): strike groups spawn spread
+  across cities instead of stacked.
+* Not yet covered: the endgame Khiva-assault (`role 6`) and outer Nuclear War
+  wave count hooks fire only when the endgame triggers.
+
 ## Build and install
 
 * Build: `cargo xwin build --release --target x86_64-pc-windows-msvc`
 * Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to
   `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`).
+  Latest: `hf_hee_v0.5.1.dll`.
 * Config: `Modloader/config/escadra.json` is auto-created with defaults on
   first run.
 
