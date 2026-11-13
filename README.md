@@ -22,7 +22,7 @@ Reverse-engineering evidence and exact call-site proofs:
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "enabled": true,
   "strikegroups": {
     "remove": [],
@@ -129,8 +129,57 @@ you want finer control. When a sub-field is omitted, the category's top-level
 }
 ```
 
+## Optional `count` field (how many groups exist in total)
+
+Four categories take an extra optional string field, `count`, that adjusts **how
+many groups of that type are spawned in total**:
+
+| Category | Vanilla count | What `count` controls |
+|---|---|---|
+| `traders` | `30` convoys at campaign start (`MOV EDX, 0x1e` `0x14028fd63`) | The convoy spawn-loop argument itself |
+| `strikegroups` | `6` roaming at campaign start (`0x14028fd4d`), up to `4` Khiva assault (`0x1402623de`), `3` outer Nuclear War (`0x1402629b1`) | Each strike-group spawn wave's loop bound |
+| `tactical_air` | per-city `chanceA` (`0.15` normal / `0.20` hard, `0` near `"UR"`) | The chance is scaled, which controls how many air groups appear in total |
+| `tactical_missile` | per-city `chanceB` (same scaling) | Same, for missile groups |
+
+Format (operand `N` must be an integer):
+
+* `"N"` — set: exactly `N` groups (e.g. `"10"` → 10 convoys)
+* `"*N"` — multiply the vanilla value by `N` (e.g. `"*2"` → 60 convoys / double the tactical chance)
+* `"-N"` — subtract `N`, clamped so the value can't go below `0` (e.g. `"-5"` → 25 convoys; on a `0.15` chance `"-1"` → `0`, i.e. no tactical groups)
+* `"+N"` — add `N` (e.g. `"+3"` → 33 convoys; on a chance, `"1"` → every city gets one)
+
+```json
+{
+  "strikegroups": { "add": ["MyBattlecruiser"], "count": "*2" },
+  "traders": { "count": "-10" },
+  "tactical_air": { "count": "0" },
+  "tactical_missile": { "count": "+1" }
+}
+```
+
+Notes:
+
+* For `tactical_air` / `tactical_missile` the op applies to the per-city spawn
+  chance inside `somethingSpawnShips` (pool `0` garrisons only — mercenary pools
+  pass `0.0` and are never affected). `"0"` disables that tactical group type
+  entirely; `"1"` makes every garrison roll it.
+* `strikegroups.count` applies the same op to each strike-group wave with that
+  wave's own vanilla count (`6` / `4` / `3`), so `"+2"` gives 8 roaming + up to 6
+  Khiva + 5 outer groups.
+* Invalid strings (non-integer `N`, empty) are logged and ignored (vanilla count).
+
 ## Changelog
 
+* **v0.4.0**:
+  * Added optional `count` string field to `traders`, `strikegroups`,
+    `tactical_air` and `tactical_missile` (`"N"` set / `"*N"` multiply /
+    `"-N"` subtract clamped at 0 / `"+N"` add). New byte-guarded detours at the
+    convoy-count argument `0x14028fd63` (`MOV EDX, 0x1e`), the campaign SG loop
+    bound `0x14028fd4d` (`CMP ESI, 0x6; JGE`), the Khiva assault wave entry
+    `0x1402623de` (clamps the walked city vector's end), and the outer Nuclear
+    War SG bound `0x1402629b1` (`CMP EAX, 0x3; JL`); tactical counts adjust the
+    `chanceA`/`chanceB` arguments in the `somethingSpawnShips` detour (pool `0`
+    only). Config schema version bumped to `4`.
 * **v0.3.1**:
   * Fixed the REX byte in the campaign Tarkhan trampoline at `0x14028f695` (`0x49 0x89 0xe9` encoded `MOV R9, RBP` instead of `0x4c 0x89 0xe9` `MOV RCX, R13`, leaving `RCX` pointing into the `"ASSASSIN"` city-type string from `0x14028f690` when `CopyString` ran).
 * **v0.3.0**:

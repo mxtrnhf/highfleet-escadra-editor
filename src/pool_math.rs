@@ -5,7 +5,7 @@
 
 use std::ffi::CString;
 
-use crate::config::{Config, PoolConfig, ShipworksConfig};
+use crate::config::{parse_count_field, Config, CountOp, PoolConfig, ShipworksConfig};
 use crate::native::DesignConvoyStats;
 use crate::pools;
 
@@ -58,6 +58,18 @@ pub fn classify_shipworks_bucket(combat_value: f32, has_planes: bool) -> Shipwor
     }
 }
 
+/// Resolved Strike Group counts for each spawn wave, derived from
+/// `strikegroups.count` applied to that wave's vanilla count.
+#[derive(Clone, Copy, Debug)]
+pub struct SgWaveCounts {
+    /// Campaign-start roaming Strike Groups (vanilla `6`, `CMP ESI, 0x6` `0x28fd4d`).
+    pub campaign: i32,
+    /// Endgame Khiva assault wave (vanilla up to `4`, one per quadrant list).
+    pub khiva: i32,
+    /// Endgame outer Nuclear War wave (vanilla `3`, `CMP EAX, 0x3` `0x2629b1`).
+    pub outer: i32,
+}
+
 /// Resolved ship lists for every native hook site, derived from `escadra.json`.
 pub struct ResolvedPools {
     pub sg_edited: bool,
@@ -100,6 +112,16 @@ pub struct ResolvedPools {
     pub traders_ships: Vec<PoolEntry>,
     pub traders_escorts: Vec<PoolEntry>,
     pub traders_escorts_hard: Vec<PoolEntry>,
+    /// Resolved Trade Convoy count (`traders.count` vs vanilla `30`).
+    pub traders_count: Option<i32>,
+
+    /// Resolved Strike Group wave counts (`strikegroups.count` vs vanilla `6`/`4`/`3`).
+    pub sg_wave_counts: Option<SgWaveCounts>,
+
+    /// Group-count ops applied at spawn time to the per-city tactical-group
+    /// chances (`chanceA` / `chanceB`, pool `0` garrisons only).
+    pub tactical_air_count_op: Option<CountOp>,
+    pub tactical_missile_count_op: Option<CountOp>,
 
     pub shipworks_edited: bool,
     pub shipworks_small: Vec<PoolEntry>,
@@ -235,7 +257,10 @@ impl ResolvedPools {
 
         // Strike Group carrier escorts: explicit `strikegroups.carrier_escorts` wins,
         // else syncs with `tactical_air` when edited.
-        let sg_carrier_cfg = sg.carrier_escorts.as_ref().unwrap_or(&config.tactical_air);
+        let sg_carrier_cfg = sg
+            .carrier_escorts
+            .as_ref()
+            .unwrap_or(&config.tactical_air.base);
 
         // Strike Group missile frigate/cruiser escort (`Tarantul ARM` in vanilla):
         // explicit `strikegroups.missile_escorts` wins, else `tactical_missile.sg_missile`,
@@ -292,12 +317,54 @@ impl ResolvedPools {
         let tm_escorts_cfg = tm.escorts.as_ref().unwrap_or(&empty);
         let tactical_missile_edited = !tm_ships_cfg.is_empty() || !tm_escorts_cfg.is_empty();
 
+        // Group-count fields: `traders.count` / `strikegroups.count` resolve against
+        // the vanilla spawn-loop counts; `tactical_air.count` / `tactical_missile.count`
+        // keep the op to apply to the per-city `chanceA` / `chanceB` at spawn time
+        // (pool `0` garrisons only — merc pools pass `0.0` and must stay unaffected).
+        let traders_count = parse_count_field("traders", &config.traders.count)
+            .map(|op| op.apply_int(pools::VANILLA_TRADER_CONVOY_COUNT as i64));
+        let sg_wave_counts = parse_count_field("strikegroups", &sg.count).map(|op| SgWaveCounts {
+            campaign: op.apply_int(pools::VANILLA_SG_CAMPAIGN_COUNT as i64),
+            khiva: op.apply_int(pools::VANILLA_SG_KHIVA_COUNT as i64),
+            outer: op.apply_int(pools::VANILLA_SG_OUTER_COUNT as i64),
+        });
+        let tactical_air_count_op = parse_count_field("tactical_air", &config.tactical_air.count);
+        let tactical_missile_count_op = parse_count_field("tactical_missile", &tm.count);
+        if let Some(op) = tactical_air_count_op {
+            log::info!(
+                "hf_hee: tactical_air.count {} applies to chanceA (pool 0)",
+                op.describe()
+            );
+        }
+        if let Some(op) = tactical_missile_count_op {
+            log::info!(
+                "hf_hee: tactical_missile.count {} applies to chanceB (pool 0)",
+                op.describe()
+            );
+        }
+        if let Some(count) = traders_count {
+            log::info!(
+                "hf_hee: traders.count -> {count} convoys (vanilla {})",
+                pools::VANILLA_TRADER_CONVOY_COUNT
+            );
+        }
+        if let Some(counts) = sg_wave_counts {
+            log::info!(
+                "hf_hee: strikegroups.count -> campaign {} (vanilla {}) / khiva {} (vanilla {}) / outer {} (vanilla {})",
+                counts.campaign, pools::VANILLA_SG_CAMPAIGN_COUNT,
+                counts.khiva, pools::VANILLA_SG_KHIVA_COUNT,
+                counts.outer, pools::VANILLA_SG_OUTER_COUNT,
+            );
+        }
+
         let spawn_ships_edited = !garrisons_campaign_cfg.is_empty()
             || !garrisons_endgame_cfg.is_empty()
             || !mercs_hire_cfg.is_empty()
             || !mercs_endgame_cfg.is_empty()
-            || !config.tactical_air.is_empty()
-            || tactical_missile_edited;
+            || !config.tactical_air.base.is_empty()
+            || tactical_missile_edited
+            || tactical_air_count_op.is_some()
+            || tactical_missile_count_op.is_some();
 
         // Tarkhans: `campaign` (city `FOR_TARKHAN`) and `tier1..tier4` (`ENDWAR_CARD` Khiva groups 1..4).
         let tarkhan_campaign_cfg = select_sub(&config.tarkhans.campaign, &config.tarkhans.base);
@@ -391,7 +458,7 @@ impl ResolvedPools {
             pool_1_dead: resolve_pool(pools::VANILLA_DEAD_POOL_1, &empty),
             pool_3_dead: resolve_pool(pools::VANILLA_DEAD_POOL_3, &empty),
 
-            tactical_air: resolve_pool(pools::VANILLA_TACTICAL_AIR, &config.tactical_air),
+            tactical_air: resolve_pool(pools::VANILLA_TACTICAL_AIR, &config.tactical_air.base),
 
             tactical_missile_edited,
             tactical_missile_ships: resolve_pool(
@@ -431,6 +498,10 @@ impl ResolvedPools {
                 pools::VANILLA_TRADERS_ESCORTS_HARD,
                 traders_escorts_hard_cfg,
             ),
+            traders_count,
+            sg_wave_counts,
+            tactical_air_count_op,
+            tactical_missile_count_op,
 
             shipworks_edited,
             shipworks_small: shipworks.small,
@@ -451,6 +522,10 @@ impl ResolvedPools {
             || self.reinforcements_edited
             || self.traders_edited
             || self.shipworks_edited
+            || self.traders_count.is_some()
+            || self.sg_wave_counts.is_some()
+            || self.tactical_air_count_op.is_some()
+            || self.tactical_missile_count_op.is_some()
     }
 }
 

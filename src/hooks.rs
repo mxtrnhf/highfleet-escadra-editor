@@ -30,13 +30,26 @@
 //!    fuel-endurance convoy escorts (`role = 1`).
 //! 8. `0x140206950` (`Fleet_BuildShopOffer` entry, 7B): Shipworks `TEST`
 //!    combat opponent selector (`SMALL` / `MID` / `LARGE` / `CARRIER`).
+//!
+//! Group-count hooks (installed only when the matching `count` field is set):
+//! 9. `0x14028fd63` (5B, `MOV EDX, 0x1e`): Trade Convoy count argument
+//!    (`traders.count`, vanilla 30 convoys at campaign start).
+//! 10. `0x14028fd4d` (5B, `CMP ESI, 0x6; JGE`): campaign roaming Strike Group
+//!    loop bound (`strikegroups.count`, vanilla 6).
+//! 11. `0x1402623de` (9B, `CMP RBX, RSI; JZ`): endgame Khiva assault SG wave —
+//!     clamps the walked vector's end `RSI` to `min(RSI, begin + 8*count)`.
+//! 12. `0x1402629b1` (9B, `CMP EAX, 0x3; JL`): endgame outer Nuclear War SG
+//!     wave bound (vanilla 3).
+//! `tactical_air.count` / `tactical_missile.count` are not separate hook sites:
+//! they adjust the `chanceA` / `chanceB` arguments inside the `somethingSpawnShips`
+//! detour (pool `0` garrisons only).
 
 use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use patchy::{PatchSession, ProcessModule, ReturnType, Trampoline};
+use patchy::{Condition, PatchSession, ProcessModule, ReturnType, Trampoline};
 
 use crate::native::{
     assign_existing_escadra_string, clear_game_string_vec, create_escadra_from_ships,
@@ -49,6 +62,7 @@ use crate::pool_math::{
     classify_shipworks_bucket, convoy_can_support_escort, roll_spawn_ships_indices,
     roll_strikegroup_indices, PoolEntry, ResolvedPools, ShipworksBucket,
 };
+use crate::pools;
 
 static RESOLVED_POOLS: OnceLock<ResolvedPools> = OnceLock::new();
 static LOGGED_HOOK_PANIC: AtomicBool = AtomicBool::new(false);
@@ -104,6 +118,48 @@ const SHIPWORKS_TEST_STOLEN: usize = 7;
 const SHIPWORKS_TEST_GUARD: [u8; 16] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48, 0x89, 0x78, 0x20, 0x55,
 ];
+
+// --- Group-count hook sites (loop bounds / count argument, verified bytes) ---
+
+/// Trade Convoy count argument: `MOV EDX, 0x1e` (vanilla 30) at `0x28fd63` in
+/// `restOfEventsPrologueAntIsaiah`, right before `CALL 0x14028fec0` (the convoy
+/// spawn loop; sole caller of that function).
+const TRADER_COUNT_RVA: usize = 0x28fd63;
+const TRADER_COUNT_STOLEN: usize = 5;
+const TRADER_COUNT_GUARD: [u8; 5] = [0xba, 0x1e, 0x00, 0x00, 0x00];
+const TRADER_COUNT_RESUME_RVA: usize = 0x28fd68;
+
+/// Campaign roaming Strike Group loop bound: `CMP ESI, 0x6; JGE` at `0x28fd4d`
+/// (`INC ESI` at `0x28fd4b` stays; `JGE` exits to `0x28fd5f`, fall-through
+/// continues at `0x28fd52`).
+const SG_COUNT_CAMPAIGN_RVA: usize = 0x28fd4d;
+const SG_COUNT_CAMPAIGN_STOLEN: usize = 5;
+const SG_COUNT_CAMPAIGN_GUARD: [u8; 5] = [0x83, 0xfe, 0x06, 0x7d, 0x0d];
+const SG_COUNT_CAMPAIGN_CONT_RVA: usize = 0x28fd52;
+const SG_COUNT_CAMPAIGN_EXIT_RVA: usize = 0x28fd5f;
+
+/// Endgame Khiva assault SG wave: vector-walk entry `CMP RBX, RSI; JZ 0x26333f`
+/// at `0x2623de` in `spawnEndgameShips?` (`0x261a20`). `RBX` = vector begin
+/// (`[RBP+0x28]`), `RSI` = end; the per-iteration check `CMP RDI, RSI` at
+/// `0x2625d5` reads the clamped `RSI`. Clamping `RSI = min(RSI, RBX + 8*count)`
+/// caps the wave at `count` spawns (and `count == 0` makes the entry `JZ` fire,
+/// spawning none). `RSI` is reloaded on every path after the loop; `RAX` is
+/// dead at this point.
+const SG_COUNT_KHIVA_RVA: usize = 0x2623de;
+const SG_COUNT_KHIVA_STOLEN: usize = 9;
+const SG_COUNT_KHIVA_GUARD: [u8; 9] = [0x48, 0x3b, 0xde, 0x0f, 0x84, 0x58, 0x0f, 0x00, 0x00];
+const SG_COUNT_KHIVA_CONT_RVA: usize = 0x2623e7;
+const SG_COUNT_KHIVA_EXIT_RVA: usize = 0x26333f;
+
+/// Endgame outer Nuclear War SG wave bound: `CMP EAX, 0x3; JL 0x2626e0` at
+/// `0x2629b1` in `spawnEndgameShips?`. `EAX` = groups spawned this wave
+/// (`[RBP-0x60]`); `JL` continues the 100-try search at `0x2626e0`,
+/// fall-through exits at `0x2629ba`.
+const SG_COUNT_OUTER_RVA: usize = 0x2629b1;
+const SG_COUNT_OUTER_STOLEN: usize = 9;
+const SG_COUNT_OUTER_GUARD: [u8; 9] = [0x83, 0xf8, 0x03, 0x0f, 0x8c, 0x26, 0xfd, 0xff, 0xff];
+const SG_COUNT_OUTER_CONT_RVA: usize = 0x2626e0;
+const SG_COUNT_OUTER_EXIT_RVA: usize = 0x2629ba;
 
 fn report_hook_panic(site: &str) {
     if !LOGGED_HOOK_PANIC.swap(true, Ordering::Relaxed) {
@@ -307,9 +363,151 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
         installed_count += 1;
     }
 
+    if let Some(count) = pools.traders_count {
+        // `MOV EDX, 0x1e` -> `MOV EDX, count`; resume right after the immediate.
+        let addr = verify_site_bytes(
+            module,
+            TRADER_COUNT_RVA,
+            &TRADER_COUNT_GUARD,
+            "trader convoy count",
+        )?;
+        let resume = module
+            .resolve_rva(TRADER_COUNT_RESUME_RVA)
+            .map_err(|e| e.to_string())?;
+        let mut tramp = Trampoline::new();
+        tramp.bytes(&[0xba]); // MOV EDX, imm32
+        tramp.bytes(&(count as u32).to_le_bytes());
+        tramp.absolute_jump(resume);
+        session
+            .detour_trampoline(addr, TRADER_COUNT_STOLEN, tramp)
+            .map_err(|e| e.to_string())?;
+        log::info!("hf_hee: traders.count -> {count} convoys @ {TRADER_COUNT_RVA:#x}");
+        installed_count += 1;
+    }
+
+    if let Some(counts) = &pools.sg_wave_counts {
+        install_sg_wave_count(
+            module,
+            &mut session,
+            SG_COUNT_CAMPAIGN_RVA,
+            &SG_COUNT_CAMPAIGN_GUARD,
+            SG_COUNT_CAMPAIGN_STOLEN,
+            SG_COUNT_CAMPAIGN_CONT_RVA,
+            SG_COUNT_CAMPAIGN_EXIT_RVA,
+            0xfe, // CMP ESI, imm32
+            Condition::GreaterOrEqual,
+            BoundBranch::ConditionalExits,
+            counts.campaign,
+            "campaign",
+        )?;
+        install_sg_wave_count(
+            module,
+            &mut session,
+            SG_COUNT_OUTER_RVA,
+            &SG_COUNT_OUTER_GUARD,
+            SG_COUNT_OUTER_STOLEN,
+            SG_COUNT_OUTER_CONT_RVA,
+            SG_COUNT_OUTER_EXIT_RVA,
+            0xf8, // CMP EAX, imm32
+            Condition::Less,
+            BoundBranch::ConditionalContinues,
+            counts.outer,
+            "outer",
+        )?;
+        // Khiva assault wave: clamp the walked vector's end pointer instead of a
+        // plain counter compare (the loop walks a city vector, not an integer).
+        let addr = verify_site_bytes(
+            module,
+            SG_COUNT_KHIVA_RVA,
+            &SG_COUNT_KHIVA_GUARD,
+            "SG khiva wave count",
+        )?;
+        let cont = module
+            .resolve_rva(SG_COUNT_KHIVA_CONT_RVA)
+            .map_err(|e| e.to_string())?;
+        let exit = module
+            .resolve_rva(SG_COUNT_KHIVA_EXIT_RVA)
+            .map_err(|e| e.to_string())?;
+        // 8 bytes per vector element; clamp so the imm32 stays in range.
+        let step = (counts.khiva as i64 * 8).clamp(0, i32::MAX as i64) as i32;
+        let mut tramp = Trampoline::new();
+        tramp.bytes(&[0x48, 0x8d, 0x83]); // LEA RAX, [RBX + step]
+        tramp.bytes(&step.to_le_bytes());
+        tramp.bytes(&[0x48, 0x39, 0xf0]); // CMP RAX, RSI
+        tramp.bytes(&[0x48, 0x0f, 0x4f, 0xc6]); // CMOVG RAX, RSI  -> RAX = min(RBX+step, RSI)
+        tramp.bytes(&[0x48, 0x89, 0xc6]); // MOV RSI, RAX    (clamp the walk end)
+        tramp.bytes(&[0x48, 0x3b, 0xde]); // CMP RBX, RSI    (re-implement stolen compare)
+        let exit_label = tramp.new_label();
+        tramp.jump_if(Condition::Equal, exit_label);
+        tramp.absolute_jump(cont);
+        tramp.bind(exit_label).map_err(|e| e.to_string())?;
+        tramp.absolute_jump(exit);
+        session
+            .detour_trampoline(addr, SG_COUNT_KHIVA_STOLEN, tramp)
+            .map_err(|e| e.to_string())?;
+        log::info!(
+            "hf_hee: strikegroups.count -> campaign {} / khiva {} / outer {} @ {SG_COUNT_CAMPAIGN_RVA:#x} / {SG_COUNT_KHIVA_RVA:#x} / {SG_COUNT_OUTER_RVA:#x}",
+            counts.campaign, counts.khiva, counts.outer,
+        );
+        installed_count += 3;
+    }
+
     let _ = RESOLVED_POOLS.set(pools);
     session.install_permanently().map_err(|e| e.to_string())?;
     Ok(installed_count)
+}
+
+/// Which resume the conditional branch targets after `CMP reg, count`.
+enum BoundBranch {
+    /// Vanilla `JGE`-style: conditional branch exits the loop, fall-through continues.
+    ConditionalExits,
+    /// Vanilla `JL`-style: conditional branch continues the loop, fall-through exits.
+    ConditionalContinues,
+}
+
+/// Installs a Strike Group wave loop-bound hook: replaces the stolen
+/// `CMP reg, vanilla_count; Jcc` with `CMP reg, count; Jcc` (same polarity,
+/// new 32-bit immediate), branching to the original continue/exit addresses.
+unsafe fn install_sg_wave_count(
+    module: ProcessModule,
+    session: &mut PatchSession,
+    rva: usize,
+    guard: &[u8],
+    stolen: usize,
+    cont_rva: usize,
+    exit_rva: usize,
+    cmp_reg_modrm: u8,
+    condition: Condition,
+    branch: BoundBranch,
+    count: i32,
+    wave: &str,
+) -> Result<(), String> {
+    let addr = verify_site_bytes(module, rva, guard, &format!("SG {wave} wave count"))?;
+    let cont = module.resolve_rva(cont_rva).map_err(|e| e.to_string())?;
+    let exit = module.resolve_rva(exit_rva).map_err(|e| e.to_string())?;
+    let mut tramp = Trampoline::new();
+    tramp.bytes(&[0x81, cmp_reg_modrm]); // CMP reg, imm32
+    tramp.bytes(&(count as u32).to_le_bytes());
+    match branch {
+        BoundBranch::ConditionalExits => {
+            let exit_label = tramp.new_label();
+            tramp.jump_if(condition, exit_label);
+            tramp.absolute_jump(cont);
+            tramp.bind(exit_label).map_err(|e| e.to_string())?;
+            tramp.absolute_jump(exit);
+        }
+        BoundBranch::ConditionalContinues => {
+            let cont_label = tramp.new_label();
+            tramp.jump_if(condition, cont_label);
+            tramp.absolute_jump(exit);
+            tramp.bind(cont_label).map_err(|e| e.to_string())?;
+            tramp.absolute_jump(cont);
+        }
+    }
+    session
+        .detour_trampoline(addr, stolen, tramp)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +563,26 @@ unsafe fn run_spawn_ships(
         3 => &pools.pool_3_dead,
         4 => &pools.mercs_cities_endgame,
         _ => &[],
+    };
+
+    // Group-count fields for tactical groups: adjust the per-city spawn chances.
+    // Only pool `0` (city garrisons) carries non-zero vanilla chances; merc pools
+    // pass `0.0` and must stay untouched.
+    let chance_a = if pool_id == pools::GARRISON_POOL_ID as i32 {
+        match pools.tactical_air_count_op {
+            Some(op) => op.apply_float(chance_a),
+            None => chance_a,
+        }
+    } else {
+        chance_a
+    };
+    let chance_b = if pool_id == pools::GARRISON_POOL_ID as i32 {
+        match pools.tactical_missile_count_op {
+            Some(op) => op.apply_float(chance_b),
+            None => chance_b,
+        }
+    } else {
+        chance_b
     };
 
     let prices: Vec<f32> = entries

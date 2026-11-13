@@ -49,6 +49,24 @@ pub const TRADE_CONVOY_FN: usize = 0x208660;
 /// (`EDC_TEST_FIGHT` at `0x13df2e`, checkboxes `SMALL`/`MID`/`LARGE`/`CARRIER`).
 pub const SHIPWORKS_TEST_FN: usize = 0x206950;
 
+// --- Vanilla group counts (loop bounds baked into `.text`) ---
+
+/// Vanilla Trade Convoy count at campaign start: `MOV EDX, 0x1e` at `0x28fd63`
+/// (argument to the convoy loop `0x28fec0`, whose tail is
+/// `CMP R12D, [RSP+0x20]; JL` at `0x290153`).
+pub const VANILLA_TRADER_CONVOY_COUNT: u32 = 30;
+/// Vanilla campaign-start roaming Strike Group count: loop tail
+/// `INC ESI; CMP ESI, 0x6; JGE` at `0x28fd4b` in `restOfEventsPrologueAntIsaiah`.
+pub const VANILLA_SG_CAMPAIGN_COUNT: u32 = 6;
+/// Vanilla endgame Khiva assault Strike Group wave cap: one SG per quadrant list
+/// (max 4); the spawn loop walks a state-2 city vector (`CMP RBX, RSI; JZ` entry
+/// at `0x2623de`, per-iteration `CMP RDI, RSI; JNZ` at `0x2625d5`) in
+/// `spawnEndgameShips?` (`0x261a20`).
+pub const VANILLA_SG_KHIVA_COUNT: u32 = 4;
+/// Vanilla endgame outer Nuclear War Strike Group wave cap:
+/// `INC EAX; CMP EAX, 0x3; JL` at `0x2629ab` in `spawnEndgameShips?`.
+pub const VANILLA_SG_OUTER_COUNT: u32 = 3;
+
 // --- Strike Groups (`Endgame_BuildEscadra` `0x2077c0`) ---
 
 pub const VANILLA_SG_FLAGSHIPS_NORMAL: &[&str] = &["Borey"];

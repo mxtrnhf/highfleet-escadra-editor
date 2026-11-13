@@ -13,7 +13,99 @@
 
 use serde::{Deserialize, Serialize};
 
-const CURRENT_CONFIG_VERSION: u32 = 3;
+const CURRENT_CONFIG_VERSION: u32 = 4;
+
+/// Optional group-count adjustment, parsed from a string in `count` fields.
+///
+/// Format:
+/// - `"N"`   — set: exactly `N` groups are allowed to exist (vanilla count replaced)
+/// - `"*N"`  — multiply the vanilla count by `N` (`N` must be an integer)
+/// - `"-N"`  — subtract `N` from the vanilla count, clamped so the value can't go below `0`
+/// - `"+N"`  — add `N` to the vanilla count
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountOp {
+    Set(i64),
+    Mul(i64),
+    Sub(i64),
+    Add(i64),
+}
+
+/// Largest count we ever bake into a 32-bit immediate (loop bounds / `MOV EDX, imm32`).
+const MAX_COUNT: i64 = 1_000_000;
+
+impl CountOp {
+    /// Parses a `count` string. Returns `None` (and the caller logs) on anything
+    /// that is not an optional sign-prefix (`*`, `-`, `+`) plus an integer.
+    pub fn parse(spec: &str) -> Option<CountOp> {
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // `i64` parse accepts only integers: `"*2.5"` or `"*2x"` are rejected.
+        match trimmed.as_bytes()[0] {
+            b'*' => Some(CountOp::Mul(trimmed[1..].trim().parse().ok()?)),
+            b'-' => Some(CountOp::Sub(trimmed[1..].trim().parse().ok()?)),
+            b'+' => Some(CountOp::Add(trimmed[1..].trim().parse().ok()?)),
+            _ => Some(CountOp::Set(trimmed.parse().ok()?)),
+        }
+    }
+
+    /// Applies the op to an integer vanilla count (loop bounds), clamping the
+    /// result to `[0, MAX_COUNT]`.
+    pub fn apply_int(self, base: i64) -> i32 {
+        let value = match self {
+            CountOp::Set(n) => n,
+            CountOp::Mul(n) => base.saturating_mul(n),
+            CountOp::Sub(n) => base.saturating_sub(n),
+            CountOp::Add(n) => base.saturating_add(n),
+        };
+        value.clamp(0, MAX_COUNT) as i32
+    }
+
+    /// Applies the op to a float vanilla value (tactical-group spawn chance),
+    /// clamping the result so it can't go below `0.0`.
+    pub fn apply_float(self, base: f32) -> f32 {
+        let n = match self {
+            CountOp::Set(n) | CountOp::Mul(n) | CountOp::Sub(n) | CountOp::Add(n) => n as f32,
+        };
+        let value = match self {
+            CountOp::Set(_) => n,
+            CountOp::Mul(_) => base * n,
+            CountOp::Sub(_) => base - n,
+            CountOp::Add(_) => base + n,
+        };
+        if value.is_nan() {
+            0.0
+        } else {
+            value.max(0.0)
+        }
+    }
+
+    /// Short human-readable form for startup logging, e.g. `"*2"`, `"+3"`, `"5"`.
+    pub fn describe(self) -> String {
+        match self {
+            CountOp::Set(n) => format!("{n}"),
+            CountOp::Mul(n) => format!("*{n}"),
+            CountOp::Sub(n) => format!("-{n}"),
+            CountOp::Add(n) => format!("+{n}"),
+        }
+    }
+}
+
+/// Parses an optional `count` string field, logging invalid values (which are
+/// then ignored, leaving the vanilla count).
+pub fn parse_count_field(category: &str, field: &Option<String>) -> Option<CountOp> {
+    let spec = field.as_ref()?;
+    match CountOp::parse(spec) {
+        Some(op) => Some(op),
+        None => {
+            log::error!(
+                "hf_hee: bad {category}.count = {spec:?}; expected \"N\", \"*N\", \"-N\" or \"+N\" with integer N"
+            );
+            None
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
@@ -25,7 +117,7 @@ pub struct Config {
     /// Roaming & Endgame Strike Groups (`Endgame_BuildEscadra` `0x2077c0`).
     pub strikegroups: StrikeGroupsConfig,
     /// Aircraft Tactical Groups (`somethingSpawnShips` `chanceA` `0x205925`).
-    pub tactical_air: PoolConfig,
+    pub tactical_air: TacticalAirConfig,
     /// Missile Tactical Groups (`somethingSpawnShips` `chanceB` `0x20596d` and
     /// endgame phase-3 rider `0x262a19`).
     pub tactical_missile: TacticalMissileConfig,
@@ -50,7 +142,7 @@ impl Default for Config {
             version: CURRENT_CONFIG_VERSION,
             enabled: true,
             strikegroups: StrikeGroupsConfig::default(),
-            tactical_air: PoolConfig::default(),
+            tactical_air: TacticalAirConfig::default(),
             tactical_missile: TacticalMissileConfig::default(),
             garrisons: GarrisonsConfig::default(),
             tarkhans: TarkhansConfig::default(),
@@ -95,6 +187,34 @@ impl PoolConfig {
             parts.push(format!("add:{}", self.add.len()));
         }
         parts.join(", ")
+    }
+}
+
+/// Aircraft Tactical Groups: flat pool edits plus the optional group-count field.
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct TacticalAirConfig {
+    #[serde(flatten)]
+    pub base: PoolConfig,
+    /// Optional group-count adjustment for Air Tactical Groups. Applies to the
+    /// per-city `chanceA` spawn probability (vanilla `0.15` normal / `0.20` hard,
+    /// `0` near `"UR"` on normal), which is what controls how many air groups
+    /// exist in total: `"0"` disables them, `"1"` gives every city one, `"*2"`
+    /// doubles the vanilla chance, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
+}
+
+impl TacticalAirConfig {
+    pub fn summary(&self) -> String {
+        let mut s = self.base.summary();
+        if let Some(count) = &self.count {
+            if s != "vanilla" {
+                s.push_str("; ");
+            }
+            s.push_str(&format!("count:{count}"));
+        }
+        s
     }
 }
 
@@ -152,11 +272,17 @@ pub struct StrikeGroupsConfig {
     /// Outer Nuclear War Strike Group phase-3 missile rider (`[Tarantul, Tarantul ARM]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endgame_rider: Option<PoolConfig>,
+    /// Optional group-count adjustment for Strike Groups. Applied to every
+    /// strike-group spawn wave's vanilla count: campaign roaming groups
+    /// (vanilla `6`), Khiva assault wave (vanilla up to `4`), and outer
+    /// Nuclear War wave (vanilla `3`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
 }
 
 impl StrikeGroupsConfig {
     pub fn summary(&self) -> String {
-        summarize_with_subs(
+        let mut s = summarize_with_subs(
             &self.base,
             &[
                 ("flagships_normal", &self.flagships_normal),
@@ -168,7 +294,14 @@ impl StrikeGroupsConfig {
                 ("khiva_extra", &self.khiva_extra),
                 ("endgame_rider", &self.endgame_rider),
             ],
-        )
+        );
+        if let Some(count) = &self.count {
+            if s != "vanilla" {
+                s.push_str("; ");
+            }
+            s.push_str(&format!("count:{count}"));
+        }
+        s
     }
 }
 
@@ -189,11 +322,16 @@ pub struct TacticalMissileConfig {
     /// Nuclear War outer Strike Group phase-3 rider (`[Tarantul, Tarantul ARM]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endgame_rider: Option<PoolConfig>,
+    /// Optional group-count adjustment for Missile Tactical Groups. Applies to
+    /// the per-city `chanceB` spawn probability (same vanilla scaling as
+    /// `chanceA`), which controls how many missile groups exist in total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
 }
 
 impl TacticalMissileConfig {
     pub fn summary(&self) -> String {
-        summarize_with_subs(
+        let mut s = summarize_with_subs(
             &self.base,
             &[
                 ("ships", &self.ships),
@@ -201,7 +339,14 @@ impl TacticalMissileConfig {
                 ("sg_missile", &self.sg_missile),
                 ("endgame_rider", &self.endgame_rider),
             ],
-        )
+        );
+        if let Some(count) = &self.count {
+            if s != "vanilla" {
+                s.push_str("; ");
+            }
+            s.push_str(&format!("count:{count}"));
+        }
+        s
     }
 }
 
@@ -331,6 +476,10 @@ pub struct TradersConfig {
     /// Hard-mode heavy convoy escort (`[Kormoran, Negev]`, 25% roll when `hardmode != 0`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escorts_hard: Option<PoolConfig>,
+    /// Optional group-count adjustment for Trade Convoys: how many convoys are
+    /// spawned at campaign start (vanilla `30`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
 }
 
 impl TradersConfig {
@@ -342,14 +491,21 @@ impl TradersConfig {
     }
 
     pub fn summary(&self) -> String {
-        summarize_with_subs(
+        let mut s = summarize_with_subs(
             &self.base,
             &[
                 ("ships", &self.ships),
                 ("escorts", &self.escorts),
                 ("escorts_hard", &self.escorts_hard),
             ],
-        )
+        );
+        if let Some(count) = &self.count {
+            if s != "vanilla" {
+                s.push_str("; ");
+            }
+            s.push_str(&format!("count:{count}"));
+        }
+        s
     }
 }
 
