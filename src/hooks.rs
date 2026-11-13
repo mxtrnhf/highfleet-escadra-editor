@@ -43,6 +43,10 @@
 //! `tactical_air.count` / `tactical_missile.count` are not separate hook sites:
 //! they adjust the `chanceA` / `chanceB` arguments inside the `somethingSpawnShips`
 //! detour (pool `0` garrisons only).
+//! 13. `0x14028fc27` (9B, `TEST RBX, RBX; JZ`): campaign SG city pick
+//!    (`strikegroups.sprinkle`) — replaces the first-eligible `Location*` in `RBX`
+//!    with a uniformly random eligible city (same `+0x2e8 >= 2` / `+0x248 != 0`
+//!    filters as the vanilla scan), so high `count` values spread across the map.
 
 use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -53,10 +57,12 @@ use patchy::{Condition, PatchSession, ProcessModule, ReturnType, Trampoline};
 
 use crate::native::{
     assign_existing_escadra_string, clear_game_string_vec, create_escadra_from_ships,
-    destroy_game_string_vec, hge_rand_float, hge_rand_int, init_uninitialized_escadra_string_cstr,
-    is_endwar, is_far_from_ur_or_hard, is_hard_mode, lookup_design_convoy_stats,
-    lookup_design_shipworks_stats, lookup_design_strength, mark_first_matching_ship_as_prize,
-    push_game_string, RawEscadraString, RawStringVec, Vec2, NPC_SHIP_FIRST_OFFSET,
+    destroy_game_string_vec, get_profile, hge_rand_float, hge_rand_int,
+    init_uninitialized_escadra_string_cstr, is_endwar, is_far_from_ur_or_hard, is_hard_mode,
+    lookup_design_convoy_stats, lookup_design_shipworks_stats, lookup_design_strength,
+    mark_first_matching_ship_as_prize, push_game_string, read_checked, RawEscadraString,
+    RawStringVec, Vec2, LOCATION_FLAG_OFFSET, LOCATION_KIND_STATE_OFFSET, NPC_SHIP_FIRST_OFFSET,
+    PROFILE_LOCATIONS_OFFSET,
 };
 use crate::pool_math::{
     classify_shipworks_bucket, convoy_can_support_escort, roll_spawn_ships_indices,
@@ -160,6 +166,17 @@ const SG_COUNT_OUTER_STOLEN: usize = 9;
 const SG_COUNT_OUTER_GUARD: [u8; 9] = [0x83, 0xf8, 0x03, 0x0f, 0x8c, 0x26, 0xfd, 0xff, 0xff];
 const SG_COUNT_OUTER_CONT_RVA: usize = 0x2626e0;
 const SG_COUNT_OUTER_EXIT_RVA: usize = 0x2629ba;
+
+/// Campaign SG city pick (`strikegroups.sprinkle`): after the location scan loop
+/// in `restOfEventsPrologueAntIsaiah`, `RBX` holds the chosen `Location*` (first
+/// eligible in vector order) — `TEST RBX, RBX; JZ 0x14028fd4b` at `0x28fc27`.
+/// The trampoline replaces `RBX` with a uniformly random eligible city instead.
+/// Continue at `0x28fc30`; the `JZ` target `0x28fd4b` is the loop tail (skip spawn).
+const SG_SPRINKLE_RVA: usize = 0x28fc27;
+const SG_SPRINKLE_STOLEN: usize = 9;
+const SG_SPRINKLE_GUARD: [u8; 9] = [0x48, 0x85, 0xdb, 0x0f, 0x84, 0x1b, 0x01, 0x00, 0x00];
+const SG_SPRINKLE_CONT_RVA: usize = 0x28fc30;
+const SG_SPRINKLE_SKIP_RVA: usize = 0x28fd4b;
 
 fn report_hook_panic(site: &str) {
     if !LOGGED_HOOK_PANIC.swap(true, Ordering::Relaxed) {
@@ -452,6 +469,39 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
         installed_count += 3;
     }
 
+    if pools.sg_sprinkle {
+        // Replace the scan result in RBX with a uniformly random eligible city.
+        let addr = verify_site_bytes(
+            module,
+            SG_SPRINKLE_RVA,
+            &SG_SPRINKLE_GUARD,
+            "SG sprinkle city pick",
+        )?;
+        let cont = module
+            .resolve_rva(SG_SPRINKLE_CONT_RVA)
+            .map_err(|e| e.to_string())?;
+        let skip = module
+            .resolve_rva(SG_SPRINKLE_SKIP_RVA)
+            .map_err(|e| e.to_string())?;
+        let mut tramp = Trampoline::new();
+        // RAX = random eligible Location* (0 when none); all volatile registers preserved.
+        tramp.preserved_call(detour_pick_sg_city as *const (), &[], &[], ReturnType::Rax);
+        tramp.bytes(&[0x48, 0x89, 0xc3]); // MOV RBX, RAX
+        tramp.bytes(&[0x48, 0x85, 0xdb]); // TEST RBX, RBX (re-implement stolen test)
+        let no_city = tramp.new_label();
+        tramp.jump_if(Condition::Equal, no_city);
+        tramp.absolute_jump(cont);
+        tramp.bind(no_city).map_err(|e| e.to_string())?;
+        tramp.absolute_jump(skip);
+        session
+            .detour_trampoline(addr, SG_SPRINKLE_STOLEN, tramp)
+            .map_err(|e| e.to_string())?;
+        log::info!(
+            "hf_hee: strikegroups.sprinkle on @ {SG_SPRINKLE_RVA:#x} (random eligible city per SG)"
+        );
+        installed_count += 1;
+    }
+
     let _ = RESOLVED_POOLS.set(pools);
     session.install_permanently().map_err(|e| e.to_string())?;
     Ok(installed_count)
@@ -508,6 +558,74 @@ unsafe fn install_sg_wave_count(
         .detour_trampoline(addr, stolen, tramp)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Strike Group city sprinkle (`strikegroups.sprinkle`, `0x14028fc27`)
+// ---------------------------------------------------------------------------
+
+/// Eligibility filters copied from the vanilla scan at `0x14028fbd8`/`0x14028fbe1`
+/// (same checks in the convoy loop at `0x14028ff70`/`0x14028ff79`):
+/// dword `[loc+0x2e8] >= 2` and float `[loc+0x248] != 0.0`.
+unsafe fn location_eligible(loc: usize) -> bool {
+    if loc == 0 {
+        return false;
+    }
+    let kind_state = read_checked::<i32>(loc + LOCATION_KIND_STATE_OFFSET).unwrap_or(0);
+    let flag = read_checked::<f32>(loc + LOCATION_FLAG_OFFSET).unwrap_or(0.0);
+    kind_state >= 2 && flag != 0.0
+}
+
+/// Picks a uniformly random eligible city from `Profile::locations` for one
+/// campaign Strike Group, replacing vanilla's first-eligible-in-vector-order
+/// pick (which stacks high `count` values onto a single city).
+unsafe fn pick_sg_city_inner() -> usize {
+    let profile = get_profile();
+    if profile == 0 {
+        return 0;
+    }
+    let Some(begin) = read_checked::<usize>(profile + PROFILE_LOCATIONS_OFFSET) else {
+        return 0;
+    };
+    let Some(end) = read_checked::<usize>(profile + PROFILE_LOCATIONS_OFFSET + 8) else {
+        return 0;
+    };
+    if begin == 0 || end < begin {
+        return 0;
+    }
+    // Bounded walk: stride-8 pointer slots, clamped (a profile has ~100 cities).
+    let slots = ((end - begin) / 8).min(4096);
+    let mut eligible = 0usize;
+    for i in 0..slots {
+        let loc = read_checked::<usize>(begin + i * 8).unwrap_or(0);
+        if location_eligible(loc) {
+            eligible += 1;
+        }
+    }
+    if eligible == 0 {
+        return 0;
+    }
+    let mut pick = hge_rand_int(0, eligible as i32 - 1) as usize;
+    for i in 0..slots {
+        let loc = read_checked::<usize>(begin + i * 8).unwrap_or(0);
+        if location_eligible(loc) {
+            if pick == 0 {
+                return loc;
+            }
+            pick -= 1;
+        }
+    }
+    0
+}
+
+unsafe extern "C" fn detour_pick_sg_city() -> usize {
+    match catch_unwind(AssertUnwindSafe(|| pick_sg_city_inner())) {
+        Ok(picked) => picked,
+        Err(_) => {
+            report_hook_panic("strikegroups.sprinkle");
+            0
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

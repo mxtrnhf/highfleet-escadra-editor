@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-const CURRENT_CONFIG_VERSION: u32 = 4;
+const CURRENT_CONFIG_VERSION: u32 = 5;
 
 /// Optional group-count adjustment, parsed from a string in `count` fields.
 ///
@@ -278,6 +278,12 @@ pub struct StrikeGroupsConfig {
     /// Nuclear War wave (vanilla `3`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<String>,
+    /// When `true`, each campaign Strike Group picks a **uniformly random
+    /// eligible city** as its spawn point instead of vanilla's first-eligible
+    /// city in vector order (which stacks high `count` values onto one city).
+    /// Defaults to `false` (vanilla behavior).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sprinkle: bool,
 }
 
 impl StrikeGroupsConfig {
@@ -300,6 +306,12 @@ impl StrikeGroupsConfig {
                 s.push_str("; ");
             }
             s.push_str(&format!("count:{count}"));
+        }
+        if self.sprinkle {
+            if s != "vanilla" {
+                s.push_str("; ");
+            }
+            s.push_str("sprinkle");
         }
         s
     }

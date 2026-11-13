@@ -117,6 +117,9 @@ pub struct ResolvedPools {
 
     /// Resolved Strike Group wave counts (`strikegroups.count` vs vanilla `6`/`4`/`3`).
     pub sg_wave_counts: Option<SgWaveCounts>,
+    /// `strikegroups.sprinkle`: pick a random eligible city per campaign SG
+    /// instead of the first eligible city in vector order.
+    pub sg_sprinkle: bool,
 
     /// Group-count ops applied at spawn time to the per-city tactical-group
     /// chances (`chanceA` / `chanceB`, pool `0` garrisons only).
@@ -500,6 +503,7 @@ impl ResolvedPools {
             ),
             traders_count,
             sg_wave_counts,
+            sg_sprinkle: sg.sprinkle,
             tactical_air_count_op,
             tactical_missile_count_op,
 
@@ -524,6 +528,7 @@ impl ResolvedPools {
             || self.shipworks_edited
             || self.traders_count.is_some()
             || self.sg_wave_counts.is_some()
+            || self.sg_sprinkle
             || self.tactical_air_count_op.is_some()
             || self.tactical_missile_count_op.is_some()
     }

@@ -59,6 +59,25 @@ const ESCADRA_CHILDREN_HEAD_OFFSET: usize = 0x100;
 /// `Location` position (`Vec2` at `+0x150`, uncovered by `highfleet-rs`; see `structures.md`).
 pub const LOCATION_POS_OFFSET: usize = 0x150;
 
+/// `Profile::locations` vector begin (`+0x210`, end at `+0x218`) — the city list
+/// scanned by the campaign Strike Group spawn loop (`0x14028fbb9`/`0x14028fbb2`
+/// and the per-location filter checks `0x14028fbd8`/`0x14028fbe1` in
+/// `restOfEventsPrologueAntIsaiah`).
+pub const PROFILE_LOCATIONS_OFFSET: usize = 0x210;
+
+/// `Location` eligibility filter fields used by the campaign SG / convoy spawn
+/// scans: dword `+0x2e8 >= 2` (`0x14028fbd8`) and float `+0x248 != 0.0`
+/// (`0x14028fbe1`, same checks in the convoy loop at `0x14028ff70`/`0x14028ff79`).
+pub const LOCATION_KIND_STATE_OFFSET: usize = 0x2e8;
+pub const LOCATION_FLAG_OFFSET: usize = 0x248;
+
+/// Returns the active `Profile*` (`Get_Profile_` `0x140292a90`), or 0 when uninitialized.
+pub unsafe fn get_profile() -> usize {
+    // SAFETY: `FN_GET_PROFILE` returns the active `Profile*` (or 0 if uninitialized).
+    let get_profile_fn: GetProfileFn = std::mem::transmute(FN_GET_PROFILE);
+    get_profile_fn()
+}
+
 /// `NPC::m_ship_first` (`EscadraString` at `+0xd0`, uncovered by `highfleet-rs`;
 /// verified from `Npc_RegisterProperties` `0x14023fbd0`).
 pub const NPC_SHIP_FIRST_OFFSET: usize = 0xd0;

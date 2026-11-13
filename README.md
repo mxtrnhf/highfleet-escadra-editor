@@ -22,7 +22,7 @@ Reverse-engineering evidence and exact call-site proofs:
 
 ```json
 {
-  "version": 4,
+  "version": 5,
   "enabled": true,
   "strikegroups": {
     "remove": [],
@@ -150,7 +150,7 @@ Format (operand `N` must be an integer):
 
 ```json
 {
-  "strikegroups": { "add": ["MyBattlecruiser"], "count": "*2" },
+  "strikegroups": { "add": ["MyBattlecruiser"], "count": "*2", "sprinkle": true },
   "traders": { "count": "-10" },
   "tactical_air": { "count": "0" },
   "tactical_missile": { "count": "+1" }
@@ -168,8 +168,25 @@ Notes:
   Khiva + 5 outer groups.
 * Invalid strings (non-integer `N`, empty) are logged and ignored (vanilla count).
 
+### Sprinkling strike groups across cities (`strikegroups.sprinkle`)
+
+Vanilla's campaign Strike Group loop picks its spawn city by scanning the city
+list **in order** and taking the first eligible one (with a Y-spacing rule) —
+with the vanilla count of 6 that yields ~6 different cities, but with a large
+`count` (e.g. `"*50"`) nearly all groups land on the same first-eligible city.
+Setting `"sprinkle": true` on `strikegroups` hooks the pick point
+(`0x14028fc27`) and chooses a **uniformly random eligible city** per group
+(same eligibility filters as vanilla: `[loc+0x2e8] >= 2`, `[loc+0x248] != 0`),
+so groups spread across the map like trade convoys do. Off by default.
+
 ## Changelog
 
+* **v0.5.0**:
+  * Added `strikegroups.sprinkle` (bool, default `false`): hooks the campaign SG
+    city pick at `0x14028fc27` and replaces the first-eligible city with a
+    uniformly random eligible city per group, so large `strikegroups.count`
+    values spread across the map instead of stacking on one city. Config
+    schema version `5`.
 * **v0.4.0**:
   * Added optional `count` string field to `traders`, `strikegroups`,
     `tactical_air` and `tactical_missile` (`"N"` set / `"*N"` multiply /
