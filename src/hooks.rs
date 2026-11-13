@@ -35,11 +35,12 @@
 //! 9. `0x14028fd63` (5B, `MOV EDX, 0x1e`): Trade Convoy count argument
 //!    (`traders.count`, vanilla 30 convoys at campaign start).
 //! 10. `0x14028fd4d` (5B, `CMP ESI, 0x6; JGE`): campaign roaming Strike Group
-//!    loop bound (`strikegroups.count`, vanilla 6).
+//!     loop bound (`strikegroups.count`, vanilla 6), plus `0x14028fb4a` (8B)
+//!     entry skip when `count <= 0` because the campaign loop is `do ... while`.
 //! 11. `0x1402623de` (9B, `CMP RBX, RSI; JZ`): endgame Khiva assault SG wave —
 //!     clamps the walked vector's end `RSI` to `min(RSI, begin + 8*count)`.
-//! 12. `0x1402629b1` (9B, `CMP EAX, 0x3; JL`): endgame outer Nuclear War SG
-//!     wave bound (vanilla 3).
+//! 12. `0x1402626b9` (9B, `CMP ESI, 0x3; JGE`) & `0x1402629b1` (9B, `CMP EAX, 0x3; JL`):
+//!     endgame outer Nuclear War SG wave top-of-loop and bottom-of-loop bounds (vanilla 3).
 //! `tactical_air.count` / `tactical_missile.count` are not separate hook sites:
 //! they adjust the `chanceA` / `chanceB` arguments inside the `somethingSpawnShips`
 //! detour (pool `0` garrisons only).
@@ -135,6 +136,13 @@ const TRADER_COUNT_STOLEN: usize = 5;
 const TRADER_COUNT_GUARD: [u8; 5] = [0xba, 0x1e, 0x00, 0x00, 0x00];
 const TRADER_COUNT_RESUME_RVA: usize = 0x28fd68;
 
+/// Campaign roaming Strike Group loop entry (`MOVSS XMM0, [0x1403c0e24]` at
+/// `0x28fb4a`, right after `rep_14026abe0_New`). Used when `count <= 0` to skip
+/// the `do ... while` loop completely (`0x28fd4d` is bottom-tested).
+const SG_COUNT_CAMPAIGN_ENTRY_RVA: usize = 0x28fb4a;
+const SG_COUNT_CAMPAIGN_ENTRY_STOLEN: usize = 8;
+const SG_COUNT_CAMPAIGN_ENTRY_GUARD: [u8; 8] = [0xf3, 0x0f, 0x10, 0x05, 0xd2, 0x12, 0x13, 0x00];
+
 /// Campaign roaming Strike Group loop bound: `CMP ESI, 0x6; JGE` at `0x28fd4d`
 /// (`INC ESI` at `0x28fd4b` stays; `JGE` exits to `0x28fd5f`, fall-through
 /// continues at `0x28fd52`).
@@ -157,10 +165,18 @@ const SG_COUNT_KHIVA_GUARD: [u8; 9] = [0x48, 0x3b, 0xde, 0x0f, 0x84, 0x58, 0x0f,
 const SG_COUNT_KHIVA_CONT_RVA: usize = 0x2623e7;
 const SG_COUNT_KHIVA_EXIT_RVA: usize = 0x26333f;
 
-/// Endgame outer Nuclear War SG wave bound: `CMP EAX, 0x3; JL 0x2626e0` at
-/// `0x2629b1` in `spawnEndgameShips?`. `EAX` = groups spawned this wave
-/// (`[RBP-0x60]`); `JL` continues the 100-try search at `0x2626e0`,
-/// fall-through exits at `0x2629ba`.
+/// Endgame outer Nuclear War SG wave bounds in `spawnEndgameShips?`:
+/// - Top `while` check: `CMP ESI, 0x3; JGE 0x2629c2` at `0x2626b9` (`ESI` =
+///   existing nearby SGs, fall-through `0x2626c2`). Needed so `count == 0` skips
+///   the loop and `count > 3` can enter when 3+ SGs already exist.
+/// - Bottom `while` check: `CMP EAX, 0x3; JL 0x2626e0` at `0x2629b1` (`EAX` =
+///   groups spawned this wave `[RBP-0x60]`, fall-through exits at `0x2629ba`).
+const SG_COUNT_OUTER_TOP_RVA: usize = 0x2626b9;
+const SG_COUNT_OUTER_TOP_STOLEN: usize = 9;
+const SG_COUNT_OUTER_TOP_GUARD: [u8; 9] = [0x83, 0xfe, 0x03, 0x0f, 0x8d, 0x00, 0x03, 0x00, 0x00];
+const SG_COUNT_OUTER_TOP_CONT_RVA: usize = 0x2626c2;
+const SG_COUNT_OUTER_TOP_EXIT_RVA: usize = 0x2629c2;
+
 const SG_COUNT_OUTER_RVA: usize = 0x2629b1;
 const SG_COUNT_OUTER_STOLEN: usize = 9;
 const SG_COUNT_OUTER_GUARD: [u8; 9] = [0x83, 0xf8, 0x03, 0x0f, 0x8c, 0x26, 0xfd, 0xff, 0xff];
@@ -403,19 +419,52 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
     }
 
     if let Some(counts) = &pools.sg_wave_counts {
+        if counts.campaign <= 0 {
+            // Campaign SG loop (`0x28fb4a`..`0x28fd5a`) is bottom-tested (`do ... while`),
+            // so patching only `0x28fd4d` still spawns 1 SG on `count == 0`. Skip the loop.
+            let addr = verify_site_bytes(
+                module,
+                SG_COUNT_CAMPAIGN_ENTRY_RVA,
+                &SG_COUNT_CAMPAIGN_ENTRY_GUARD,
+                "SG campaign wave entry",
+            )?;
+            let exit = module
+                .resolve_rva(SG_COUNT_CAMPAIGN_EXIT_RVA)
+                .map_err(|e| e.to_string())?;
+            let mut tramp = Trampoline::new();
+            tramp.absolute_jump(exit);
+            session
+                .detour_trampoline(addr, SG_COUNT_CAMPAIGN_ENTRY_STOLEN, tramp)
+                .map_err(|e| e.to_string())?;
+        } else {
+            install_sg_wave_count(
+                module,
+                &mut session,
+                SG_COUNT_CAMPAIGN_RVA,
+                &SG_COUNT_CAMPAIGN_GUARD,
+                SG_COUNT_CAMPAIGN_STOLEN,
+                SG_COUNT_CAMPAIGN_CONT_RVA,
+                SG_COUNT_CAMPAIGN_EXIT_RVA,
+                0xfe, // CMP ESI, imm32
+                Condition::GreaterOrEqual,
+                BoundBranch::ConditionalExits,
+                counts.campaign,
+                "campaign",
+            )?;
+        }
         install_sg_wave_count(
             module,
             &mut session,
-            SG_COUNT_CAMPAIGN_RVA,
-            &SG_COUNT_CAMPAIGN_GUARD,
-            SG_COUNT_CAMPAIGN_STOLEN,
-            SG_COUNT_CAMPAIGN_CONT_RVA,
-            SG_COUNT_CAMPAIGN_EXIT_RVA,
+            SG_COUNT_OUTER_TOP_RVA,
+            &SG_COUNT_OUTER_TOP_GUARD,
+            SG_COUNT_OUTER_TOP_STOLEN,
+            SG_COUNT_OUTER_TOP_CONT_RVA,
+            SG_COUNT_OUTER_TOP_EXIT_RVA,
             0xfe, // CMP ESI, imm32
             Condition::GreaterOrEqual,
             BoundBranch::ConditionalExits,
-            counts.campaign,
-            "campaign",
+            counts.outer,
+            "outer-top",
         )?;
         install_sg_wave_count(
             module,
@@ -462,11 +511,16 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
         session
             .detour_trampoline(addr, SG_COUNT_KHIVA_STOLEN, tramp)
             .map_err(|e| e.to_string())?;
+        let campaign_rva = if counts.campaign <= 0 {
+            SG_COUNT_CAMPAIGN_ENTRY_RVA
+        } else {
+            SG_COUNT_CAMPAIGN_RVA
+        };
         log::info!(
-            "hf_hee: strikegroups.count -> campaign {} / khiva {} / outer {} @ {SG_COUNT_CAMPAIGN_RVA:#x} / {SG_COUNT_KHIVA_RVA:#x} / {SG_COUNT_OUTER_RVA:#x}",
+            "hf_hee: strikegroups.count -> campaign {} / khiva {} / outer {} @ {campaign_rva:#x} / {SG_COUNT_KHIVA_RVA:#x} / {SG_COUNT_OUTER_TOP_RVA:#x}+{SG_COUNT_OUTER_RVA:#x}",
             counts.campaign, counts.khiva, counts.outer,
         );
-        installed_count += 3;
+        installed_count += 4;
     }
 
     if pools.sg_sprinkle {

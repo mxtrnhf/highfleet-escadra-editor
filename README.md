@@ -186,6 +186,14 @@ their own garrison city), so no sprinkle flag exists for them.
 
 ## Changelog
 
+* **v0.5.2**:
+  * Fixed `strikegroups.count: "0"` still spawning 1 campaign Strike Group
+    (the campaign SG loop at `0x14028fb4a`..`0x14028fd4d` is bottom-tested
+    `do ... while`, so patching only the tail compare still ran iteration 0;
+    now skips the loop at `0x14028fb4a` when `count <= 0`).
+  * Also patched the outer Nuclear War SG top-of-loop bound `0x1402626b9`
+    (`CMP ESI, 0x3; JGE`) alongside `0x1402629b1` so `count == 0` skips that
+    wave and `count > 3` can enter even when 3+ SGs already exist nearby.
 * **v0.5.1**:
   * `strikegroups.sprinkle` now **defaults to `true`** (config schema `6`); set
     `"sprinkle": false` to restore vanilla's first-eligible-city stacking.
@@ -234,7 +242,7 @@ their own garrison city), so no sprinkle flag exists for them.
 * Build: `cargo xwin build --release --target x86_64-pc-windows-msvc`
 * Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to
   `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`).
-  Latest: `hf_hee_v0.5.1.dll`.
+  Latest: `hf_hee_v0.5.2.dll`.
 * Config: `Modloader/config/escadra.json` is auto-created with defaults on
   first run.
 
