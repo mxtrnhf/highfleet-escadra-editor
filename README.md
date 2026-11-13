@@ -22,7 +22,7 @@ Reverse-engineering evidence and exact call-site proofs:
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "enabled": true,
   "strikegroups": {
     "remove": [],
@@ -173,14 +173,22 @@ Notes:
 Vanilla's campaign Strike Group loop picks its spawn city by scanning the city
 list **in order** and taking the first eligible one (with a Y-spacing rule) —
 with the vanilla count of 6 that yields ~6 different cities, but with a large
-`count` (e.g. `"*50"`) nearly all groups land on the same first-eligible city.
-Setting `"sprinkle": true` on `strikegroups` hooks the pick point
-(`0x14028fc27`) and chooses a **uniformly random eligible city** per group
-(same eligibility filters as vanilla: `[loc+0x2e8] >= 2`, `[loc+0x248] != 0`),
-so groups spread across the map like trade convoys do. Off by default.
+`count` (e.g. `"*50"`) nearly all groups land on the same first-eligible city
+(observed in a real save: 295 of 300 SGs at city `ISA`).
+
+`strikegroups.sprinkle` **defaults to `true`**: the pick point (`0x14028fc27`)
+is hooked and each group chooses a **uniformly random eligible city** (same
+eligibility filters as vanilla: `[loc+0x2e8] >= 2`, `[loc+0x248] != 0`), so
+groups spread across the map like trade convoys do. Set `"sprinkle": false`
+for vanilla behavior. Trade convoys and tactical groups never clustered in the
+first place (convoys pick a uniform random city each; tactical groups attach to
+their own garrison city), so no sprinkle flag exists for them.
 
 ## Changelog
 
+* **v0.5.1**:
+  * `strikegroups.sprinkle` now **defaults to `true`** (config schema `6`); set
+    `"sprinkle": false` to restore vanilla's first-eligible-city stacking.
 * **v0.5.0**:
   * Added `strikegroups.sprinkle` (bool, default `false`): hooks the campaign SG
     city pick at `0x14028fc27` and replaces the first-eligible city with a

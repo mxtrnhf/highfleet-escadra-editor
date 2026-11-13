@@ -1,6 +1,6 @@
 [package]
 name = "hf-hee"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "MIT"
 description = "Highfleet Escadra Editor (HEE): config-driven edits to every hard-coded ship pool (strike groups, tactical air/missile groups, garrisons, Tarkhans, mercenaries/reinforcements, trade convoys, and Shipworks test combat). Steam 1.163."

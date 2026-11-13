@@ -13,7 +13,13 @@
 
 use serde::{Deserialize, Serialize};
 
-const CURRENT_CONFIG_VERSION: u32 = 5;
+const CURRENT_CONFIG_VERSION: u32 = 6;
+
+/// `strikegroups.sprinkle` defaults to `true`: campaign Strike Groups pick a
+/// random eligible city per group instead of stacking on one city.
+fn default_sprinkle() -> bool {
+    true
+}
 
 /// Optional group-count adjustment, parsed from a string in `count` fields.
 ///
@@ -141,7 +147,10 @@ impl Default for Config {
         Self {
             version: CURRENT_CONFIG_VERSION,
             enabled: true,
-            strikegroups: StrikeGroupsConfig::default(),
+            strikegroups: StrikeGroupsConfig {
+                sprinkle: default_sprinkle(),
+                ..StrikeGroupsConfig::default()
+            },
             tactical_air: TacticalAirConfig::default(),
             tactical_missile: TacticalMissileConfig::default(),
             garrisons: GarrisonsConfig::default(),
@@ -278,11 +287,11 @@ pub struct StrikeGroupsConfig {
     /// Nuclear War wave (vanilla `3`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<String>,
-    /// When `true`, each campaign Strike Group picks a **uniformly random
-    /// eligible city** as its spawn point instead of vanilla's first-eligible
-    /// city in vector order (which stacks high `count` values onto one city).
-    /// Defaults to `false` (vanilla behavior).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// When `true` (the default), each campaign Strike Group picks a
+    /// **uniformly random eligible city** as its spawn point instead of
+    /// vanilla's first-eligible city in vector order (which stacks high
+    /// `count` values onto one city). Set to `false` for vanilla behavior.
+    #[serde(default = "default_sprinkle")]
     pub sprinkle: bool,
 }
 
