@@ -10,8 +10,12 @@
 //! - `hf_notes/docs/findings/strategy/mercenary-ships.md`
 //! - `hf_notes/docs/structures.md`
 
-use std::ffi::{c_char, c_void};
+use std::collections::HashMap;
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::mem::{offset_of, size_of};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
 
 pub use highfleet::general::{CVec, EscadraString, Node, SentinelList};
@@ -107,9 +111,15 @@ const FN_VEC_STRING_CLEAR: usize = 0x1_4015_cd20;
 /// `VectorString_Destroy(vec)` (`0x14005e580`): destroys all elements and frees
 /// the backing buffer of a game-owned `CVec<EscadraString>`.
 const FN_VEC_STRING_DESTROY: usize = 0x1_4005_e580;
-/// `retCreature154c_(cstr)` (`0x140219980`): looks up `cstr` in `LIB_SHIPS`
-/// (`0x143a13a70`) and returns `design+0x15f8` (`f32` price/strength scalar).
-const FN_DESIGN_STRENGTH: usize = 0x1_4021_9980;
+/// `New(size)` (`0x140334094`): game CRT heap allocator.
+const FN_CRT_NEW: usize = 0x1_4033_4094;
+/// `Node::Node(this)` (`0x14027f200`): constructs a `0x128`-byte `Node`.
+const FN_NODE_CTOR: usize = 0x1_4027_f200;
+/// `Ship_LoadSeriaAndMarkPrize(path)` (`0x1401b08a0`): loads a `.seria` design
+/// and appends it to `LIB_SHIPS` (`0x143a13a70`).
+const FN_SHIP_LOAD_SERIA_AND_MARK_PRIZE: usize = 0x1_401b_08a0;
+/// `Node::name` `EscadraString` offset (`0xc8`).
+const NODE_NAME_OFFSET: usize = 0xc8;
 /// `GetPropertyLinkedObject(prop)` (`0x14021b070`): resolves an `Escadra` child
 /// property node to its linked ship `Creature*`.
 const FN_GET_PROPERTY_LINKED_OBJECT: usize = 0x1_4021_b070;
@@ -187,7 +197,10 @@ type StringInitFromCStrFn =
 type VecStringMovePushFn = unsafe extern "C" fn(*mut RawStringVec, *mut RawEscadraString);
 type VecStringClearFn = unsafe extern "C" fn(*mut RawStringVec);
 type VecStringDestroyFn = unsafe extern "C" fn(*mut RawStringVec);
-type DesignStrengthFn = unsafe extern "C" fn(*const c_char) -> f32;
+type CrtNewFn = unsafe extern "C" fn(usize) -> usize;
+type NodeCtorFn = unsafe extern "C" fn(usize) -> usize;
+type NodeDtorFn = unsafe extern "C" fn(usize, i32);
+type ShipLoadSeriaFn = unsafe extern "C" fn(*const c_char);
 type NodeFindChildByNameFn = unsafe extern "C" fn(usize, *const c_char) -> usize;
 type GetPropertyLinkedObjectFn = unsafe extern "C" fn(usize) -> usize;
 type GetProfileFn = unsafe extern "C" fn() -> usize;
@@ -297,25 +310,254 @@ pub unsafe fn push_game_string(vec: *mut RawStringVec, name_cstr: *const c_char)
     tidy_fn(&mut temp);
 }
 
-/// Resolves `name_cstr` in `LIB_SHIPS` (`0x143a13a70`) to its root `Creature*`,
-/// following the exact chain in `retCreature154c_` (`0x140219980..0x1402199c8`).
+struct CachedDesign {
+    container_node: usize,
+    mtime: Option<SystemTime>,
+}
+
+struct CustomShipCache {
+    ship_dirs: Vec<String>,
+    loaded: HashMap<String, CachedDesign>,
+    missing_logged: std::collections::HashSet<String>,
+}
+
+static CUSTOM_SHIP_CACHE: OnceLock<Mutex<CustomShipCache>> = OnceLock::new();
+
+fn cache_lock() -> std::sync::MutexGuard<'static, CustomShipCache> {
+    CUSTOM_SHIP_CACHE
+        .get_or_init(|| {
+            Mutex::new(CustomShipCache {
+                ship_dirs: vec!["Modloader/ships".to_string(), "Ships".to_string()],
+                loaded: HashMap::new(),
+                missing_logged: std::collections::HashSet::new(),
+            })
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Configures the ordered list of directories searched for custom `.seria`
+/// ship designs not present in vanilla `Objects/Designs/`.
+pub fn init_custom_ship_dirs(dirs: Vec<String>) {
+    let mut cache = cache_lock();
+    cache.ship_dirs = dirs;
+}
+
+struct LibShipsSwapGuard {
+    previous: usize,
+}
+
+impl Drop for LibShipsSwapGuard {
+    fn drop(&mut self) {
+        // SAFETY: `LIB_SHIPS_GLOBAL` (`0x143a13a70`) is the game's writable pointer
+        // global; restoring `self.previous` returns it to its original `LIB_SHIPS`.
+        unsafe {
+            *(LIB_SHIPS_GLOBAL as *mut usize) = self.previous;
+        }
+    }
+}
+
+unsafe fn find_child_by_name(parent_node: usize, name_cstr: *const c_char) -> usize {
+    if parent_node == 0 || name_cstr.is_null() {
+        return 0;
+    }
+    let Some(vtbl) = read_checked::<usize>(parent_node) else {
+        return 0;
+    };
+    let Some(find_fn_addr) = read_checked::<usize>(vtbl + NODE_VTBL_FIND_CHILD_BY_NAME) else {
+        return 0;
+    };
+    if find_fn_addr == 0 {
+        return 0;
+    }
+    // SAFETY: `parent_node` is a live `Node*`; vtable `+0xb8` is `Node::FindChildByName`.
+    let find_fn: NodeFindChildByNameFn = std::mem::transmute(find_fn_addr);
+    find_fn(parent_node, name_cstr)
+}
+
+unsafe fn create_private_ship_container() -> Option<usize> {
+    let crt_new: CrtNewFn = std::mem::transmute(FN_CRT_NEW);
+    let node_ctor: NodeCtorFn = std::mem::transmute(FN_NODE_CTOR);
+    let copy_str: CopyStringFn = std::mem::transmute(FN_COPY_STRING);
+    let raw = crt_new(0x128);
+    if raw == 0 {
+        return None;
+    }
+    let node = node_ctor(raw);
+    if node == 0 {
+        return None;
+    }
+    copy_str(
+        (node + NODE_NAME_OFFSET) as *mut RawEscadraString,
+        c"HEE_SHIP".as_ptr(),
+        8,
+    );
+    Some(node)
+}
+
+unsafe fn destroy_private_ship_container(container_node: usize) {
+    if container_node == 0 {
+        return;
+    }
+    if let Some(vtbl) = read_checked::<usize>(container_node) {
+        if let Some(dtor_addr) = read_checked::<usize>(vtbl) {
+            if dtor_addr != 0 {
+                // SAFETY: `dtor_addr` is `Node::~Node(this, deleting=1)` at vtable `+0x00`.
+                let dtor: NodeDtorFn = std::mem::transmute(dtor_addr);
+                dtor(container_node, 1);
+            }
+        }
+    }
+}
+
+fn find_seria_in_dirs(dirs: &[String], name: &str) -> Option<(PathBuf, Option<SystemTime>)> {
+    for dir in dirs {
+        let candidate = PathBuf::from(dir).join(format!("{name}.seria"));
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            if meta.is_file() {
+                return Some((candidate, meta.modified().ok()));
+            }
+        }
+    }
+    None
+}
+
+unsafe fn load_design_into_private_container(
+    path_str: &str,
+    expected_name_cstr: *const c_char,
+    expected_name: &str,
+) -> Option<usize> {
+    let path_cstr = CString::new(path_str).ok()?;
+    let container = create_private_ship_container()?;
+
+    let prev_lib = *(LIB_SHIPS_GLOBAL as *const usize);
+    *(LIB_SHIPS_GLOBAL as *mut usize) = container;
+    let _guard = LibShipsSwapGuard { previous: prev_lib };
+
+    // SAFETY: `Ship_LoadSeriaAndMarkPrize` (`0x1401b08a0`) loads the `.seria` file
+    // and appends it to `[LIB_SHIPS_GLOBAL]`, which `_guard` restores on drop.
+    let load_fn: ShipLoadSeriaFn = std::mem::transmute(FN_SHIP_LOAD_SERIA_AND_MARK_PRIZE);
+    load_fn(path_cstr.as_ptr());
+    drop(_guard);
+
+    let children_count = read_checked::<usize>(container + NODE_CHILDREN_OFFSET + 8).unwrap_or(0);
+    if children_count == 0 {
+        destroy_private_ship_container(container);
+        return None;
+    }
+
+    // If the file was renamed on disk so internal `m_name` differs from filename stem,
+    // sync the loaded child's `Node::name` so `FindChildByName` matches it.
+    if find_child_by_name(container, expected_name_cstr) == 0 {
+        if let Some(head) = read_checked::<usize>(container + NODE_CHILDREN_OFFSET) {
+            if let Some(first_dll) = read_checked::<usize>(head) {
+                if let Some(child_node) = read_checked::<usize>(first_dll + 0x10) {
+                    if child_node != 0 {
+                        let copy_str: CopyStringFn = std::mem::transmute(FN_COPY_STRING);
+                        copy_str(
+                            (child_node + NODE_NAME_OFFSET) as *mut RawEscadraString,
+                            expected_name_cstr,
+                            expected_name.len(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Some(container)
+}
+
+/// Ensures `name_cstr` is available either in vanilla `LIB_SHIPS` (`0x143a13a70`)
+/// or in HEE's private `CustomShipCache` (loaded from `ship_dirs` without
+/// touching `LIB_SHIPS`, so Shipworks never hides/locks `Ships/` designs).
+///
+/// Returns `Some(private_container)` when resolved from `ship_dirs`, or `None`
+/// when `LIB_SHIPS` already has it (or the design was not found).
+pub unsafe fn ensure_custom_design_container(name_cstr: *const c_char) -> Option<usize> {
+    if name_cstr.is_null() {
+        return None;
+    }
+    let lib_ships = read_checked::<usize>(LIB_SHIPS_GLOBAL).unwrap_or(0);
+    if lib_ships != 0 && find_child_by_name(lib_ships, name_cstr) != 0 {
+        return None;
+    }
+    let Ok(name) = CStr::from_ptr(name_cstr).to_str() else {
+        return None;
+    };
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut cache = cache_lock();
+    let found = find_seria_in_dirs(&cache.ship_dirs, name);
+    let Some((path, mtime)) = found else {
+        if cache.missing_logged.insert(name.to_string()) {
+            log::warn!(
+                "hf_hee: ship design {name:?} not found in Objects/Designs/ or {:?}",
+                cache.ship_dirs
+            );
+        }
+        return None;
+    };
+
+    if let Some(entry) = cache.loaded.get(name) {
+        if entry.mtime == mtime {
+            return Some(entry.container_node);
+        }
+        let old_container = entry.container_node;
+        destroy_private_ship_container(old_container);
+        cache.loaded.remove(name);
+        log::info!(
+            "hf_hee: reloading modified design {name:?} from {}",
+            path.display()
+        );
+    } else {
+        log::info!(
+            "hf_hee: loaded custom design {name:?} from {}",
+            path.display()
+        );
+    }
+
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    let container = load_design_into_private_container(&path_str, name_cstr, name)?;
+    cache.loaded.insert(
+        name.to_string(),
+        CachedDesign {
+            container_node: container,
+            mtime,
+        },
+    );
+    Some(container)
+}
+
+/// Callback used by the `renderShipPhoto__` and `Ship_CloneDesignAndInit`
+/// detours: returns `LIB_SHIPS` when it has `name_cstr`, else HEE's private
+/// container for that custom design (or `LIB_SHIPS` on miss).
+pub unsafe extern "C" fn resolve_ship_library_for_name(name_cstr: *const c_char) -> usize {
+    if let Some(container) = ensure_custom_design_container(name_cstr) {
+        return container;
+    }
+    read_checked::<usize>(LIB_SHIPS_GLOBAL).unwrap_or(0)
+}
+
+/// Resolves `name_cstr` in `LIB_SHIPS` (`0x143a13a70`) or HEE's private custom
+/// ship cache to its root `Creature*`, following `retCreature154c_` (`0x140219980..0x1402199c8`).
 pub unsafe fn lookup_design_creature(name_cstr: *const c_char) -> Option<usize> {
     if name_cstr.is_null() {
         return None;
     }
-    let lib_ships = read_checked::<usize>(LIB_SHIPS_GLOBAL)?;
-    if lib_ships == 0 {
-        return None;
+    let lib_ships = read_checked::<usize>(LIB_SHIPS_GLOBAL).unwrap_or(0);
+    let mut design_node = if lib_ships != 0 {
+        find_child_by_name(lib_ships, name_cstr)
+    } else {
+        0
+    };
+    if design_node == 0 {
+        if let Some(container) = ensure_custom_design_container(name_cstr) {
+            design_node = find_child_by_name(container, name_cstr);
+        }
     }
-    let vtbl = read_checked::<usize>(lib_ships)?;
-    let find_fn_addr = read_checked::<usize>(vtbl + NODE_VTBL_FIND_CHILD_BY_NAME)?;
-    if find_fn_addr == 0 {
-        return None;
-    }
-    // SAFETY: `lib_ships` is the live `LIB_SHIPS` `Node*`; vtable `+0xb8` is
-    // `Node::FindChildByName(this, const char*)`.
-    let find_fn: NodeFindChildByNameFn = std::mem::transmute(find_fn_addr);
-    let design_node = find_fn(lib_ships, name_cstr);
     if design_node == 0 {
         return None;
     }
@@ -333,15 +575,12 @@ pub unsafe fn lookup_design_creature(name_cstr: *const c_char) -> Option<usize> 
     (creature != 0).then_some(creature)
 }
 
-/// Looks up `name_cstr` in `LIB_SHIPS` (`0x143a13a70`) and returns `design+0x15f8`.
+/// Looks up `name_cstr` in `LIB_SHIPS` or HEE's custom cache and returns `design+0x15f8`.
 pub unsafe fn lookup_design_strength(name_cstr: *const c_char) -> f32 {
-    if name_cstr.is_null() {
+    let Some(creature) = lookup_design_creature(name_cstr) else {
         return 0.0;
-    }
-    // SAFETY: `FN_DESIGN_STRENGTH` (`0x140219980`) checks `newNode_ != null` and
-    // `param_1 != null`, returning `0.0` when a design is absent.
-    let strength_fn: DesignStrengthFn = std::mem::transmute(FN_DESIGN_STRENGTH);
-    strength_fn(name_cstr)
+    };
+    read_checked::<f32>(creature + CREATURE_COMBAT_VALUE_OFFSET).unwrap_or(0.0)
 }
 
 /// Reads fuel/speed stats for `spawnTradeConvoy?` from a `LIB_SHIPS` design.

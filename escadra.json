@@ -1,6 +1,10 @@
 {
-  "version": 6,
   "enabled": true,
+  "ship_dirs": [
+    "Modloader/ships",
+    "Ships"
+  ],
+  "groups": {},
   "strikegroups": {
     "remove": [],
     "add": []

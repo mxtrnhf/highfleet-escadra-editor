@@ -1,33 +1,124 @@
-# hf_hee — Highfleet Escadra Editor
+# hf_hee — Highfleet Escadra Editor (HEE)
 
-HEE makes every ship spawn pool in HighFleet (Steam 1.163 only) editable from
-one config file, `Modloader/config/escadra.json`. All pools are hard-coded inline
-in `.text` (no data files), so HEE installs byte-verified native detours only
-for the pools you edit (leaving untouched pools completely unhooked).
+HEE lets you edit every hard-coded ship spawn pool in HighFleet (**Steam 1.163 only**) from one file: `Modloader/config/escadra.json`.
 
-Reverse-engineering evidence and exact call-site proofs:
-* `hf_notes/docs/findings/strategy/enemy-ship-pools.md`
-* `hf_notes/docs/findings/strategy/mercenary-ships.md`
+Untouched pools stay completely unhooked. Pools you edit install byte-verified detours at startup.
 
-## How to use `Modloader/config/escadra.json`
+---
 
-1. Put any custom `.seria` ship designs into **`Objects/Designs/`** (e.g.
-   `Objects/Designs/MyCruiser.seria` -> `"MyCruiser"`).
-2. Edit whichever of the **8 top-level pools** you want in `Modloader/config/escadra.json`:
-   * `"add": ["MyCruiser"]` — adds to the vanilla pool (listing a ship twice
-     doubles its draw weight).
-   * `"remove": ["Slogger"]` — removes matching ships from the vanilla pool.
-   * `"replace": ["MyCruiser", "Gladiator"]` *(optional)* — replaces the **entire
-     vanilla pool** with your exact list, not one individual ship with another.
+## Using custom ships (without touching `Objects/Designs/`)
+
+**Do not move custom `.seria` files into `Objects/Designs/`.** HighFleet treats `Objects/Designs/` as read-only "Original Designs" and hides or locks them in Shipworks until unlocked in a campaign save.
+
+Instead, leave your ships in **`Ships/`** (where Shipworks saves them) or put them in **`Modloader/ships/`**:
+
+1. Vanilla ships in `Objects/Designs/` always work by bare name in `add`, `remove`, and `replace` (`"remove": ["Courageous"]` removes a vanilla ship from that pool—`ship_dirs` is only for custom ships).
+2. HEE searches `"ship_dirs"` in order (`["Modloader/ships", "Ships"]` by default) for any ship name not already in vanilla `Objects/Designs/`.
+3. Custom designs are loaded into a **private HEE cache**—never into the game's `LIB_SHIPS` list—so Shipworks continues to treat them as normal, editable player designs.
+4. HEE checks file modification times before spawning, so if you edit a ship in Shipworks and immediately click `TEST`, HEE reloads the updated `.seria` without restarting the game.
+
+---
+
+## Quick start (`Modloader/config/escadra.json`)
+
+Every pool supports three operations, applied in order:
+
+1. **`"replace"`** *(optional)* — replaces the **entire** pool with your list (it is *not* an old-for-new pair list).
+2. **`"remove"`** — drops matching ship names from the pool.
+3. **`"add"`** — appends ship names to the pool (listing a ship twice doubles its draw weight).
 
 ```json
 {
-  "version": 6,
   "enabled": true,
+  "ship_dirs": ["Modloader/ships", "Ships"],
+  "groups": {
+    "my_escorts": ["MyCorvette", "MyFrigate"]
+  },
+  "garrisons": {
+    "remove": ["Courageous"],
+    "add": ["@my_escorts"]
+  },
+  "shipworks": {
+    "add": ["Modloader/ships/test_targets/*"]
+  }
+}
+```
+
+---
+
+## Wildcards & reusable `@groups`
+
+To avoid copying long ship lists across multiple pools:
+
+* **Named groups (`"groups"`):** define `"my_fleet": ["ShipA", "ShipB"]` at the top level and reference `"@my_fleet"` inside any `add`, `remove`, or `replace` array (nested `@groups` are supported).
+* **Folder wildcards (`*`, `?`):** e.g. `"Modloader/ships/garrisons/*"` or `"Ships/enemy_*"` loads all matching `.seria` files from that folder (sorted alphabetically) and automatically registers that folder for lookup.
+* **Name wildcards:**
+  * In `add` / `replace`: `"MyCorvette_*"` matches `.seria` files across `ship_dirs` and `Objects/Designs/`.
+  * In `remove`: `"Gladiator*"` drops every matching ship from the current pool (`Gladiator`, `Gladiator MRL`, `Gladiator LANCE`).
+
+---
+
+## The 8 spawn pools
+
+| Pool | What it controls | Optional sub-fields |
+|---|---|---|
+| `strikegroups` | Roaming & endgame Strike Groups | `flagships_normal`, `flagships_hard`, `fill_normal`, `fill_hard`, `missile_escorts`, `carrier_escorts`, `khiva_extra`, `endgame_rider`, `count`, `sprinkle` |
+| `tactical_air` | City aircraft tactical groups & SG carrier escorts | `count` |
+| `tactical_missile` | City missile tactical groups & SG missile riders | `ships`, `escorts`, `sg_missile`, `endgame_rider`, `count` |
+| `garrisons` | City garrisons (campaign & Nuclear War) | `campaign`, `endgame`, `include_in_shipworks` *(bool, mirrors edits into `shipworks`)* |
+| `tarkhans` | Named Tarkhan personal ships & Khiva finale flagships | `campaign`, `tier0`, `tier1`, `tier2`, `tier3`, `tier4` |
+| `mercs` | Mercenary `FOR_HIRE`, Nuclear War `FOR_JOIN`, `ASK_REINFORCE` | `hire`, `endgame`, `reinforcements`, `reinforcements_tier0` |
+| `traders` | Trade Convoys *(flat `add`/`remove` edits escorts safely)* | `ships` *(prize hulls, auto-marked capturable `m_prize = 1`)*, `escorts`, `escorts_hard`, `count` |
+| `shipworks` | Shipworks `TEST` combat opponents *(flat `add` auto-classifies by stats)* | `small`, `mid`, `large`, `carrier` |
+
+When a sub-field is omitted, the category's top-level `replace`/`remove`/`add` applies. When specified, that sub-field overrides it.
+
+---
+
+## Group counts (`count`), spawn math & `strikegroups.sprinkle`
+
+`traders`, `strikegroups`, `tactical_air`, and `tactical_missile` accept an optional `"count"` string. `N` must be an **integer** (`"*2.5"` is rejected and logged):
+
+* `"N"` — set exact value (`"10"` -> 10, `"0"` -> disable)
+* `"*N"` — multiply the vanilla value by `N` (`"*2"` -> double)
+* `"-N"` — subtract `N` (clamped at `0`)
+* `"+N"` — add `N`
+
+### How each category's `count` & spawn math works
+
+* **`traders` (vanilla `30` campaign convoys):** sets the exact convoy-loop count at campaign start (`0` skips the loop; quest convoy `CROW50` is separate). Each convoy picks 1 prize ship (`traders.ships`) plus fuel-gated escorts (`2` normal / `4` hard max).
+* **`strikegroups` (vanilla `6` campaign / up to `4` Khiva assault / `3` outer Nuclear War):** applies the same op to **all three** Strike Group waves using each wave's own baseline (e.g. `"+2"` -> `8` roaming, up to `6` Khiva capped by the 4 quadrant vectors, `5` outer Nuclear War). `"0"` skips all three waves.
+  * *Strike Group composition:* picks the **first** flagship in `flagships_*` with `combat_value <= budget * 0.5` (falling back to the last entry), then fills up to `1.2 * budget` (10 consecutive-reject cap), then rolls `25%` normal / `50%` hard for a carrier escort and (when hard mode or `>= 5000` from `"UR"`) a missile escort.
+  * **`strikegroups.sprinkle`** *(default `true`)* spreads campaign Strike Groups across uniformly random eligible cities instead of vanilla's first-eligible-city scan (which piles high `count` values onto a single city). Set `"sprinkle": false` for vanilla behavior.
+* **`tactical_air` & `tactical_missile` (per-city spawn probability, not an integer count):** tactical groups are not separate fleets at campaign start—they are appended onto Pool `0` city garrisons when `RandFloat(0, 1) < chance` (vanilla `0.15` normal / `0.20` hard, and `0.0` within `5000` of `"UR"` on normal).
+  * `"count"` applies to that per-city probability (Pool `0` garrisons only; mercenary pools pass `0.0` and are never affected).
+  * `"*2"` doubles each city's chance (`0.15` -> `0.30`); `"0"` sets it to `0.0` (disables that tactical group type); `"1"` or `"+1"` raises it to `>= 1.0` so **every** eligible garrison spawns one.
+  * *Why `"-1"` disables them:* `0.15 - 1 = -0.85`, clamped to `0.0`. Because `N` is an integer, `"-N"` on a `0.15`/`0.20` chance always clamps to `0.0`.
+  * *Near `"UR"` on normal:* vanilla forces `chance = 0.0` within `5000` of `"UR"`, so `"*2"` still yields `0.0` near `"UR"`, whereas `"1"` or `"+1"` overrides it to `1.0` everywhere.
+* **Garrisons & Mercs budget roll:** rolls ships up to `1.2 * budget` (10 attempts, 10 consecutive-reject limit, preferring `>= 3` ships within `[0.9 * budget, 1.2 * budget]`); tactical packages are appended *after* the budget roll.
+
+All changes affect **new campaigns and future spawns**—ships already saved in an existing `profile.seria` are not rewritten.
+
+---
+
+## Example: Basic edited `escadra.json`
+
+A minimal config using flat lists only—ideal when you want to tweak a few
+garrisons, swap out a vanilla ship, and add your own `Ships/` designs to
+Shipworks `TEST` without touching the rest of the game:
+
+> **Note:** The examples below use `//` comments for readability. Real `escadra.json` files must be strict JSON (strip `//` comments when copying).
+
+```jsonc
+{
+  "enabled": true,
+  "ship_dirs": ["Modloader/ships", "Ships"],
   "strikegroups": {
     "remove": [],
-    "add": []
+    // Keep vanilla Strike Groups and add one custom cruiser to every SG pool.
+    "add": ["MyCustomCruiser"]
   },
+  // Leaving a pool's arrays empty keeps it 100% vanilla (unhooked).
   "tactical_air": {
     "remove": [],
     "add": []
@@ -37,8 +128,9 @@ Reverse-engineering evidence and exact call-site proofs:
     "add": []
   },
   "garrisons": {
-    "remove": [],
-    "add": []
+    // Drop a vanilla ship you dislike, then append two custom designs from Ships/.
+    "remove": ["Courageous"],
+    "add": ["MyCustomCorvette", "MyCustomFrigate"]
   },
   "tarkhans": {
     "remove": [],
@@ -54,229 +146,146 @@ Reverse-engineering evidence and exact call-site proofs:
   },
   "shipworks": {
     "remove": [],
-    "add": []
+    // Flat "add" auto-classifies each ship into SMALL/MID/LARGE/CARRIER by its stats.
+    "add": ["MyCustomCorvette", "MyCustomFrigate", "MyCustomCruiser"]
   }
 }
 ```
 
-| Pool | What it controls |
-|---|---|
-| `strikegroups` | **Roaming & Endgame Strike Groups** (`Endgame_BuildEscadra` `0x2077c0`): heavy cruisers, flagships, SG escorts, Khiva `Typhon`, and outer Nuclear War riders. |
-| `tactical_air` | **Aircraft Tactical Groups**: carriers spawned in city tactical groups (`0x205925`, `Longbow`) and SG carrier escorts (`Wasp`, `Longbow`). |
-| `tactical_missile` | **Missile Tactical Groups**: strategic-missile cruisers spawned in city tactical groups (`0x20596d`: `Tarantul`, `Eagle`, `Tarantul MRL`, escorted by `Hound`) plus SG missile riders (`Tarantul`, `Tarantul ARM`). |
-| `garrisons` | **City Garrisons**: 13-ship base pool defending Khiva, the 6 HQ ring cities, and generated towns (`somethingSpawnShips` `0x203b80`, pool `0`). |
-| `tarkhans` | **Tarkhan Ships**: personal ships of named Tarkhans in cities (`0x28f695`) and Khiva defense `ENDWAR_CARD` Tarkhan flagships (`0x238e70` groups `1..4` + `tier0` fallback). |
-| `mercs` | **Mercenaries & Reinforcements**: paid `FOR_HIRE` pier ships in Mercenary cities (pool `2`), free `FOR_JOIN` pier ships during Nuclear War (pool `4`), and Tarkhan `ASK_REINFORCE` support ships (`0x21b96f`). |
-| `traders` | **Trade Convoys** (`spawnTradeConvoy?` `0x208660`): convoy escorts (fuel-range drafted) and prize trade ships (`Pegasus`, `Odissey`, `Kastor`, `Pollux`, `Kadesh Mk1`). |
-| `shipworks` | **Shipworks `TEST` Combat** (`Fleet_BuildShopOffer` `0x206950`): opponent pools for the `SMALL`, `MID`, `LARGE`, and `CARRIER` checkboxes in the Shipworks editor. |
+**What this does:**
+
+* **`strikegroups`:** keeps all vanilla Strike Group ships and adds `MyCustomCruiser` (loaded from `Ships/MyCustomCruiser.seria`) to every Strike Group pool.
+* **`garrisons`:** removes `Courageous` from city garrisons and adds `MyCustomCorvette` and `MyCustomFrigate`.
+* **`shipworks`:** adds your three custom ships to Shipworks `TEST` combat, auto-classifying each into `SMALL` / `MID` / `LARGE` / `CARRIER` from its stats.
+* **Empty pools (`tactical_air`, `tactical_missile`, `tarkhans`, `mercs`, `traders`):** completely unhooked and untouched.
 
 ---
 
-## Optional extra fields (nuanced per-subpool control)
+## Example: Heavily edited `escadra.json` (total fleet overhaul)
 
-You can keep `escadra.json` completely flat (`add`/`remove`/`replace` on the 8
-categories above), **or** add optional sub-pool objects inside any category when
-you want finer control. When a sub-field is omitted, the category's top-level
-`add`/`remove`/`replace` applies; when specified, that sub-field overrides it:
+A full `"this game is mine and I will play with MY ships"` overhaul using
+`@groups`, folder & name wildcards, sub-pools, `replace`, `count`, and
+`sprinkle`:
 
-* **`strikegroups`**:
-  * `flagships_normal` (`Borey`), `flagships_hard` (`Nomad Mk2, Nomad, Gryphon`)
-  * `fill_normal` (`Kormoran, Negev, Borey`), `fill_hard` (`Gryphon, Kormoran, Negev, Borey`)
-  * `missile_escorts` (`Tarantul ARM` — missile frigate/cruiser escort with SGs)
-  * `carrier_escorts` (`Wasp, Longbow`), `khiva_extra` (`Typhon`), `endgame_rider` (`Tarantul, Tarantul ARM`)
-* **`tactical_missile`**:
-  * `ships` (`Tarantul, Eagle, Tarantul MRL`), `escorts` (`Hound`), `sg_missile` (`Tarantul ARM`), `endgame_rider` (`Tarantul, Tarantul ARM`)
-* **`garrisons`**:
-  * `campaign` — usual campaign city garrisons (`Profile.endwar == 0`)
-  * `endgame` — late-game city spawns after Khiva defense / Nuclear War begins (`Profile.endwar != 0`; also used as fallback for `mercs.endgame` pool `4` unless `mercs.endgame` is set)
-  * `include_in_shipworks` *(boolean, default `false`)* — automatically mirror `garrisons` edits into Shipworks `TEST` combat
-* **`tarkhans`**:
-  * `campaign` — named Tarkhan personal ships in cities (`FOR_TARKHAN`)
-  * `tier0` — Khiva defense escort fallback (`Navarin, Scarab, Meteor Mk3, Fatman, Lightning Mk2`)
-  * `tier1`..`tier4` — Khiva defense `ENDWAR_CARD` flagship loyalty tiers (`tier1` = 14 light/medium hulls, `tier2` = 6 heavy cruisers, `tier3` = `Triumphant, Longbow, Kormoran, Negev`, `tier4` = `Vega, Nomad, Nomad Mk2`)
-* **`mercs`**:
-  * `hire` (Mercenary city `FOR_HIRE` pool `2`), `endgame` (Nuclear War city `FOR_JOIN` pool `4`), `reinforcements` (`ASK_REINFORCE` tier `1`), `reinforcements_tier0`
-* **`traders`**:
-  * *(Top-level `traders.add` / `remove` edits convoy escorts safely so combat ships aren't accidentally turned into unarmed prizes.)*
-  * `ships` — prize trade ships (`Pegasus`, `Odissey`, `Kastor` x2, `Pollux` x2, `Kadesh Mk1` x2). Custom designs added here are automatically marked `m_prize = 1, m_playable = 0` so they can be captured intact!
-  * `escorts` — standard convoy escorts (`Intrepid, Scarab, Ballistic, Talos, Slogger, Lightning, Meteor Mk3, Meteor Mk2, Courageous`)
-  * `escorts_hard` — Hard-mode heavy convoy escorts (`Kormoran, Negev`)
-* **`shipworks`**:
-  * *(Top-level `shipworks.add` auto-classifies custom ships into `SMALL`/`MID`/`LARGE`/`CARRIER` from their live `LIB_SHIPS` aircraft & combat-value stats!)*
-  * `small`, `mid`, `large`, `carrier` — explicit per-checkbox overrides
-
-### Example with nuanced sub-fields
-
-```json
+```jsonc
 {
-  "garrisons": {
-    "campaign": { "remove": ["Courageous"], "add": ["MyCorvette"] },
-    "endgame": { "add": ["MyHeavyCruiser"] },
-    "include_in_shipworks": true
+  "enabled": true,
+  // Custom design folders searched in priority order before falling back to vanilla Objects/Designs/.
+  "ship_dirs": [
+    "Modloader/ships/my_faction",
+    "Modloader/ships",
+    "Ships"
+  ],
+  // Reusable named groups referenced as "@name" anywhere below.
+  "groups": {
+    "corvettes": ["Ships/my_corvettes/*"],                   // Folder glob: loads all .seria in Ships/my_corvettes/
+    "frigates": ["Modloader/ships/my_faction/frigate_*"],   // Prefix glob inside a custom folder
+    "cruisers": ["MyCruiser_A", "MyCruiser_B"],
+    "carriers": ["MyCarrier_Light", "MyCarrier_Heavy"],
+    "missile_ships": ["MyMissileBoat", "MyMissileCruiser"],
+    "garrison_mix": ["@corvettes", "@frigates", "@cruisers"] // Nested @group composition
   },
   "strikegroups": {
-    "add": ["MyBattlecruiser"],
-    "missile_escorts": { "replace": ["MyMissileFrigate"] }
+    // Sub-pool overrides replace every vanilla Strike Group role with your own roster.
+    "flagships_normal": { "replace": ["@cruisers"] },
+    "flagships_hard": { "replace": ["MyCruiser_B", "MyDreadnought"] },
+    "fill_normal": { "replace": ["@frigates", "@cruisers"] },
+    "fill_hard": { "replace": ["@frigates", "@cruisers", "MyDreadnought"] },
+    "missile_escorts": { "replace": ["@missile_ships"] },
+    "carrier_escorts": { "replace": ["@carriers"] },
+    "khiva_extra": { "replace": ["MySuperheavyFlagship"] },
+    "endgame_rider": { "replace": ["@missile_ships"] },
+    "count": "+2",     // +2 groups per wave (8 roaming, up to 4 Khiva, 5 outer Nuclear War)
+    "sprinkle": true   // Scatter roaming SGs across random eligible cities
+  },
+  "tactical_air": {
+    "replace": ["@carriers"],
+    "count": "*2"      // Double per-city air TG spawn chance (0.15 -> 0.30 normal, 0.20 -> 0.40 hard)
+  },
+  "tactical_missile": {
+    "ships": { "replace": ["@missile_ships"] },
+    "escorts": { "replace": ["@corvettes"] },
+    "sg_missile": { "replace": ["@missile_ships"] },
+    "endgame_rider": { "replace": ["@missile_ships"] },
+    "count": "*2"      // Double per-city missile TG spawn chance
+  },
+  "garrisons": {
+    "campaign": {
+      "replace": ["@garrison_mix"],
+      "remove": ["*_proto"] // Wildcard remove: drop any prototype hulls from the expanded group
+    },
+    "endgame": {
+      "replace": ["@frigates", "@cruisers", "MyDreadnought"]
+    },
+    "include_in_shipworks": false
   },
   "tarkhans": {
-    "campaign": { "add": ["MyTarkhanCruiser"] },
-    "tier4": { "add": ["MySuperFlagship"] }
+    "campaign": { "replace": ["@cruisers", "MyTarkhanFlagship"] },
+    "tier0": { "replace": ["@corvettes"] },
+    "tier1": { "replace": ["@frigates"] },
+    "tier2": { "replace": ["@cruisers"] },
+    "tier3": { "replace": ["@cruisers", "MyDreadnought"] },
+    "tier4": { "replace": ["MyDreadnought", "MySuperheavyFlagship"] }
+  },
+  "mercs": {
+    "hire": { "replace": ["@corvettes", "@frigates"] },           // FOR_HIRE city piers
+    "endgame": { "replace": ["@cruisers", "@carriers"] },         // Nuclear War FOR_JOIN piers
+    "reinforcements": { "replace": ["@frigates", "@cruisers"] },  // Tarkhan ASK_REINFORCE
+    "reinforcements_tier0": { "replace": ["@corvettes"] }         // Tier 0 call-in escorts
   },
   "traders": {
-    "ships": { "add": ["MyMerchantman"] },
-    "escorts": { "add": ["MyEscortFrigate"] }
+    "ships": { "replace": ["MyFreighter_Small", "MyFreighter_Large"] }, // Prize hulls (m_prize = 1)
+    "escorts": { "replace": ["@corvettes", "@frigates"] },
+    "escorts_hard": { "replace": ["@cruisers"] },
+    "count": "25"      // Spawn 25 campaign convoys instead of vanilla 30
+  },
+  "shipworks": {
+    // Explicit TEST checkbox buckets instead of auto-classification.
+    "small": { "replace": ["@corvettes"] },
+    "mid": { "replace": ["@frigates"] },
+    "large": { "replace": ["@cruisers", "MyDreadnought"] },
+    "carrier": { "replace": ["@carriers"] }
   }
 }
 ```
 
-### Example: `replace` replaces a whole pool, not individual ships
+**What this does:**
 
-This config fragment discards the vanilla campaign garrison pool and uses only
-`MyCorvette` and `MyCruiser` as its base ship choices:
+* **`ship_dirs` & `groups`:** searches your custom faction folder first, expands folder wildcards (`Ships/my_corvettes/*`) and prefix wildcards (`frigate_*`), and composes `@garrison_mix` from nested `@groups`.
+* **`strikegroups`:** replaces every vanilla Strike Group role (`flagships_*`, `fill_*`, escorts, Khiva superheavy, endgame rider) with your own roster, adds `+2` groups per wave (`8` roaming, up to `4` Khiva, `5` outer Nuclear War), and scatters roaming groups across random eligible cities (`"sprinkle": true`).
+* **`tactical_air` & `tactical_missile`:** replaces vanilla `Longbow`/`Tarantul`/`Hound` tactical packages with your own carriers and missile boats, and doubles (`"*2"`) their per-city spawn chance.
+* **`garrisons`:** replaces campaign and Nuclear War city garrisons with your fleet while filtering out any prototype designs matching `*_proto`.
+* **`tarkhans` & `mercs`:** replaces every Tarkhan personal ship, Khiva finale tier (`tier1`–`tier4`), mercenary `FOR_HIRE` pier ship, Nuclear War `FOR_JOIN` ship, and `ASK_REINFORCE` call-in.
+* **`traders`:** replaces unarmed prize merchant hulls (`ships`, auto-marked capturable `m_prize = 1`) and convoy escorts (`escorts` / `escorts_hard`), and sets total campaign convoys to `25`.
+* **`shipworks`:** explicitly assigns each `TEST` checkbox (`SMALL` / `MID` / `LARGE` / `CARRIER`) to your own ships so you can test against your exact faction roster.
 
-```json
-{
-  "garrisons": {
-    "campaign": { "replace": ["MyCorvette", "MyCruiser"] }
-  }
-}
-```
+---
 
-The array is **not an old-ship/new-ship pair**. Both names are choices in the
-new pool. It also does not mean every garrison contains exactly those two ships:
-the game still rolls ships from the pool according to its spawning rules.
-`replace` applies first, then `remove`, then `add`; inside a sub-pool, it replaces
-that sub-pool only.
+## Build & install
 
-To swap one design while keeping the other vanilla choices, use `remove` and
-`add` instead: `"campaign": { "remove": ["Courageous"], "add": ["MyCorvette"] }`.
-These settings affect future spawns, not ships already present in a save.
+* Build: `cargo xwin build --release --target x86_64-pc-windows-msvc`
+* Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`). Latest: `hf_hee_v0.6.0.dll`.
+* Release packs: include `README.md` alongside the DLL so users have the `escadra.json` reference.
+* Config: `Modloader/config/escadra.json` is auto-created on first run if missing. Existing v6 configs load without changes.
 
-## Optional `count` field (how many groups exist in total)
-
-Four categories take an extra optional string field, `count`, that adjusts **how
-many groups of that type are spawned in total**:
-
-| Category | Vanilla count | What `count` controls |
-|---|---|---|
-| `traders` | `30` convoys at campaign start (`MOV EDX, 0x1e` `0x14028fd63`) | The convoy spawn-loop argument itself |
-| `strikegroups` | `6` roaming at campaign start (`0x14028fd4d`), up to `4` Khiva assault (`0x1402623de`), `3` outer Nuclear War (`0x1402629b1`) | Each strike-group spawn wave's loop bound |
-| `tactical_air` | per-city `chanceA` (`0.15` normal / `0.20` hard, `0` near `"UR"`) | The chance is scaled, which controls how many air groups appear in total |
-| `tactical_missile` | per-city `chanceB` (same scaling) | Same, for missile groups |
-
-Format (operand `N` must be an integer):
-
-* `"N"` — set: exactly `N` groups (e.g. `"10"` → 10 convoys)
-* `"*N"` — multiply the vanilla value by `N` (e.g. `"*2"` → 60 convoys / double the tactical chance)
-* `"-N"` — subtract `N`, clamped so the value can't go below `0` (e.g. `"-5"` → 25 convoys; on a `0.15` chance `"-1"` → `0`, i.e. no tactical groups)
-* `"+N"` — add `N` (e.g. `"+3"` → 33 convoys; on a chance, `"1"` → every city gets one)
-
-```json
-{
-  "strikegroups": { "add": ["MyBattlecruiser"], "count": "*2", "sprinkle": true },
-  "traders": { "count": "-10" },
-  "tactical_air": { "count": "0" },
-  "tactical_missile": { "count": "+1" }
-}
-```
-
-Notes:
-
-* For `tactical_air` / `tactical_missile` the op applies to the per-city spawn
-  chance inside `somethingSpawnShips` (pool `0` garrisons only — mercenary pools
-  pass `0.0` and are never affected). `"0"` disables that tactical group type
-  entirely; `"1"` makes every garrison roll it.
-* `strikegroups.count` applies the same op to each strike-group wave with that
-  wave's own vanilla count (`6` / `4` / `3`), so `"+2"` gives 8 roaming + up to 6
-  Khiva + 5 outer groups.
-* Invalid strings (non-integer `N`, empty) are logged and ignored (vanilla count).
-
-### Sprinkling strike groups across cities (`strikegroups.sprinkle`)
-
-Vanilla's campaign Strike Group loop picks its spawn city by scanning the city
-list **in order** and taking the first eligible one (with a Y-spacing rule) —
-with the vanilla count of 6 that yields ~6 different cities, but with a large
-`count` (e.g. `"*50"`) nearly all groups land on the same first-eligible city
-(observed in a real save: 295 of 300 SGs at city `ISA`).
-
-`strikegroups.sprinkle` **defaults to `true`**: the pick point (`0x14028fc27`)
-is hooked and each group chooses a **uniformly random eligible city** (same
-eligibility filters as vanilla: `[loc+0x2e8] >= 2`, `[loc+0x248] != 0`), so
-groups spread across the map like trade convoys do. Set `"sprinkle": false`
-for vanilla behavior. Trade convoys and tactical groups never clustered in the
-first place (convoys pick a uniform random city each; tactical groups attach to
-their own garrison city), so no sprinkle flag exists for them.
+---
 
 ## Changelog
 
-* **v0.5.2**:
-  * Fixed `strikegroups.count: "0"` still spawning 1 campaign Strike Group
-    (the campaign SG loop at `0x14028fb4a`..`0x14028fd4d` is bottom-tested
-    `do ... while`, so patching only the tail compare still ran iteration 0;
-    now skips the loop at `0x14028fb4a` when `count <= 0`).
-  * Also patched the outer Nuclear War SG top-of-loop bound `0x1402626b9`
-    (`CMP ESI, 0x3; JGE`) alongside `0x1402629b1` so `count == 0` skips that
-    wave and `count > 3` can enter even when 3+ SGs already exist nearby.
-* **v0.5.1**:
-  * `strikegroups.sprinkle` now **defaults to `true`** (config schema `6`); set
-    `"sprinkle": false` to restore vanilla's first-eligible-city stacking.
-* **v0.5.0**:
-  * Added `strikegroups.sprinkle` (bool, default `false`): hooks the campaign SG
-    city pick at `0x14028fc27` and replaces the first-eligible city with a
-    uniformly random eligible city per group, so large `strikegroups.count`
-    values spread across the map instead of stacking on one city. Config
-    schema version `5`.
-* **v0.4.0**:
-  * Added optional `count` string field to `traders`, `strikegroups`,
-    `tactical_air` and `tactical_missile` (`"N"` set / `"*N"` multiply /
-    `"-N"` subtract clamped at 0 / `"+N"` add). New byte-guarded detours at the
-    convoy-count argument `0x14028fd63` (`MOV EDX, 0x1e`), the campaign SG loop
-    bound `0x14028fd4d` (`CMP ESI, 0x6; JGE`), the Khiva assault wave entry
-    `0x1402623de` (clamps the walked city vector's end), and the outer Nuclear
-    War SG bound `0x1402629b1` (`CMP EAX, 0x3; JL`); tactical counts adjust the
-    `chanceA`/`chanceB` arguments in the `somethingSpawnShips` detour (pool `0`
-    only). Config schema version bumped to `4`.
-* **v0.3.1**:
-  * Fixed the REX byte in the campaign Tarkhan trampoline at `0x14028f695` (`0x49 0x89 0xe9` encoded `MOV R9, RBP` instead of `0x4c 0x89 0xe9` `MOV RCX, R13`, leaving `RCX` pointing into the `"ASSASSIN"` city-type string from `0x14028f690` when `CopyString` ran).
-* **v0.3.0**:
-  * Fixed campaign-start crash when editing `tarkhans`: `patchy-rs` `preserved_call` at `0x14028f695` clobbered Win64 non-volatile `XMM6`/`XMM7`/`XMM15` loop invariants in `restOfEventsPrologueAntIsaiah`, and `endgameTarkhanShipNames?` (`0x140238e70`) required C++ `sret` initialization (`0x140015390`) on raw stack memory.
-  * Added `shipworks` category (`Fleet_BuildShopOffer` `0x140206950` for Shipworks `TEST` combat checkboxes, with automatic `SMALL`/`MID`/`LARGE`/`CARRIER` classification and optional `garrisons.include_in_shipworks`).
-  * Added `traders` category (`spawnTradeConvoy?` `0x140208660` for convoy escorts and prize trade ships, including automatic `m_prize` capture tagging on custom trader hulls).
-  * Added optional nuanced sub-fields across all categories (`tarkhans.tier0..tier4`, `strikegroups.missile_escorts`, `garrisons.campaign`/`endgame`, `mercs.hire`/`endgame`/`reinforcements`, `traders.ships`/`escorts`/`escorts_hard`, `shipworks.small`/`mid`/`large`/`carrier`) while keeping the flat JSON structure fully supported.
+* **v0.6.0**:
+  * Custom `.seria` ships now load directly from `"ship_dirs"` (default `["Modloader/ships", "Ships"]`) into a private HEE cache without touching `LIB_SHIPS` (`0x143a13a70`), so Shipworks never hides or locks custom designs and edits reload automatically on `mtime` change.
+  * Added `"groups"` (`"@group_name"`) and `*` / `?` wildcard expansion (both folder globs like `"Ships/my_pack/*"` and name patterns like `"Gladiator*"`).
+  * Removed the unused `"version"` field from `escadra.json` (existing configs with `"version"` still load fine).
+* **v0.5.2**: Fixed `strikegroups.count: "0"` still spawning 1 campaign Strike Group and fixed outer Nuclear War SG top-of-loop bound `0x1402626b9`.
+* **v0.5.1**: `strikegroups.sprinkle` now defaults to `true`.
+* **v0.5.0**: Added `strikegroups.sprinkle` (`0x14028fc27`).
+* **v0.4.0**: Added `count` support to `traders`, `strikegroups`, `tactical_air`, and `tactical_missile`.
+* **v0.3.1**: Fixed REX byte in campaign Tarkhan trampoline (`0x14028f695`).
+* **v0.3.0**: Added `shipworks` and `traders` categories, nuanced sub-pools, and fixed campaign Tarkhan `XMM` preservation.
 
-## Validation
-
-* **v0.4.0 counts — verified in a real save** (`Saves/Profile_1/profile.seria`,
-  Steam 1.163, saved 2026-11-13 with `"count": "*50"` on `traders` and
-  `strikegroups`): the save contains exactly **1500 role-1 trade convoys**
-  (vanilla 30 × 50) and **300 role-5 strike groups** (vanilla 6 × 50).
-  Scan a save with [`../hf_dev_tools/save_scan.py`](../hf_dev_tools/README.md).
-* **v0.4.0 clustering — verified in the same save**: without sprinkle, 295 of
-  the 300 SGs sat at one city (`ISA`); convoys already spread (853 distinct
-  positions over 1500).
-* **v0.5.1 sprinkle — validated in game** (Steam 1.163, hf_hee v0.5.1,
-  `strikegroups.count` `*10`, sprinkle default-on): strike groups spawn spread
-  across cities instead of stacked.
-* **v0.5.2 zero counts — verified in a new campaign save** (Steam 1.163,
-  `Saves/Profile_1/profile.seria`, saved 2026-11-13 11:34): with `count: "0"`
-  on strike groups, tactical air, tactical missile, and traders, the scanner
-  found 95 garrisons and the player fleet, with no role-1/3/4/5/6 groups.
-  Garrison ship lists contained only the 13 vanilla base designs, with no
-  tactical carrier packages. The 11:33:18 startup log confirms v0.5.2 loaded
-  and installed all 8 patches, including the campaign loop-entry skip.
-* Not yet covered: the endgame Khiva-assault (`role 6`) and outer Nuclear War
-  wave count hooks fire only when the endgame triggers.
-
-## Build and install
-
-* Build: `cargo xwin build --release --target x86_64-pc-windows-msvc`
-* Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to
-  `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`).
-  Latest: `hf_hee_v0.5.2.dll`.
-* Config: `Modloader/config/escadra.json` is auto-created with defaults on
-  first run.
+---
 
 ## Credits
 
-* [logdot's HighFleet Modloader](https://github.com/logdot/Highfleet-Modloader) (`highfleet-mod-api`) and [`patchy-rs`](https://github.com/logdot/patchy-rs) for mod entry points, logging, and executable detours.
-* [logdot's `highfleet-rs`](https://github.com/logdot/highfleet-rs) for Steam 1.163 native layout definitions.
+* [logdot's HighFleet Modloader](https://github.com/logdot/Highfleet-Modloader) (`highfleet-mod-api`) and [`patchy-rs`](https://github.com/logdot/patchy-rs)
+* [logdot's `highfleet-rs`](https://github.com/logdot/highfleet-rs)

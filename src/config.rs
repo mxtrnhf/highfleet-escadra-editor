@@ -11,14 +11,20 @@
 //! optional sub-pool is explicitly specified, that sub-pool overrides the base edit
 //! for that specific sub-table.
 
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-const CURRENT_CONFIG_VERSION: u32 = 6;
+use serde::{Deserialize, Serialize};
 
 /// `strikegroups.sprinkle` defaults to `true`: campaign Strike Groups pick a
 /// random eligible city per group instead of stacking on one city.
 fn default_sprinkle() -> bool {
     true
+}
+
+/// Default directories searched (in order) for custom `.seria` ship designs
+/// that are not in vanilla `Objects/Designs/`.
+fn default_ship_dirs() -> Vec<String> {
+    vec!["Modloader/ships".to_string(), "Ships".to_string()]
 }
 
 /// Optional group-count adjustment, parsed from a string in `count` fields.
@@ -116,10 +122,15 @@ pub fn parse_count_field(category: &str, field: &Option<String>) -> Option<Count
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
-    /// Schema version.
-    pub version: u32,
     /// Master switch. When false the mod loads, logs, and changes nothing.
     pub enabled: bool,
+    /// Directories searched (in order) for custom `.seria` ship designs not
+    /// present in vanilla `Objects/Designs/`.
+    #[serde(default = "default_ship_dirs")]
+    pub ship_dirs: Vec<String>,
+    /// Named ship lists reusable via `"@group_name"` in any `add`, `remove`, or `replace`.
+    #[serde(default)]
+    pub groups: BTreeMap<String, Vec<String>>,
     /// Roaming & Endgame Strike Groups (`Endgame_BuildEscadra` `0x2077c0`).
     pub strikegroups: StrikeGroupsConfig,
     /// Aircraft Tactical Groups (`somethingSpawnShips` `chanceA` `0x205925`).
@@ -145,8 +156,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            version: CURRENT_CONFIG_VERSION,
             enabled: true,
+            ship_dirs: default_ship_dirs(),
+            groups: BTreeMap::new(),
             strikegroups: StrikeGroupsConfig {
                 sprinkle: default_sprinkle(),
                 ..StrikeGroupsConfig::default()

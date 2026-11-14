@@ -58,12 +58,12 @@ use patchy::{Condition, PatchSession, ProcessModule, ReturnType, Trampoline};
 
 use crate::native::{
     assign_existing_escadra_string, clear_game_string_vec, create_escadra_from_ships,
-    destroy_game_string_vec, get_profile, hge_rand_float, hge_rand_int,
+    destroy_game_string_vec, get_profile, hge_rand_float, hge_rand_int, init_custom_ship_dirs,
     init_uninitialized_escadra_string_cstr, is_endwar, is_far_from_ur_or_hard, is_hard_mode,
     lookup_design_convoy_stats, lookup_design_shipworks_stats, lookup_design_strength,
-    mark_first_matching_ship_as_prize, push_game_string, read_checked, RawEscadraString,
-    RawStringVec, Vec2, LOCATION_FLAG_OFFSET, LOCATION_KIND_STATE_OFFSET, NPC_SHIP_FIRST_OFFSET,
-    PROFILE_LOCATIONS_OFFSET,
+    mark_first_matching_ship_as_prize, push_game_string, read_checked,
+    resolve_ship_library_for_name, RawEscadraString, RawStringVec, Vec2, LOCATION_FLAG_OFFSET,
+    LOCATION_KIND_STATE_OFFSET, NPC_SHIP_FIRST_OFFSET, PROFILE_LOCATIONS_OFFSET,
 };
 use crate::pool_math::{
     classify_shipworks_bucket, convoy_can_support_escort, roll_spawn_ships_indices,
@@ -193,6 +193,23 @@ const SG_SPRINKLE_STOLEN: usize = 9;
 const SG_SPRINKLE_GUARD: [u8; 9] = [0x48, 0x85, 0xdb, 0x0f, 0x84, 0x1b, 0x01, 0x00, 0x00];
 const SG_SPRINKLE_CONT_RVA: usize = 0x28fc30;
 const SG_SPRINKLE_SKIP_RVA: usize = 0x28fd4b;
+
+/// `renderShipPhoto__` (`0x1401c2eb6`): `MOV RCX, [LIB_SHIPS]` (7 bytes -> `0x1401c2ebd`).
+/// Resolves custom ship designs from `ship_dirs` without polluting `LIB_SHIPS`.
+const RENDER_SHIP_PHOTO_LIB_RVA: usize = 0x1c2eb6;
+const RENDER_SHIP_PHOTO_LIB_RESUME_RVA: usize = 0x1c2ebd;
+const RENDER_SHIP_PHOTO_LIB_STOLEN: usize = 7;
+const RENDER_SHIP_PHOTO_LIB_GUARD: [u8; 16] = [
+    0x48, 0x8b, 0x0d, 0xb3, 0x0b, 0x85, 0x03, 0x48, 0x8b, 0x01, 0xff, 0x90, 0xb8, 0x00, 0x00, 0x00,
+];
+
+/// `Ship_CloneDesignAndInit` (`0x140209b3a`): `MOV RCX, [LIB_SHIPS]` (7 bytes -> `0x140209b41`).
+const CLONE_DESIGN_LIB_RVA: usize = 0x209b3a;
+const CLONE_DESIGN_LIB_RESUME_RVA: usize = 0x209b41;
+const CLONE_DESIGN_LIB_STOLEN: usize = 7;
+const CLONE_DESIGN_LIB_GUARD: [u8; 16] = [
+    0x48, 0x8b, 0x0d, 0x2f, 0x9f, 0x80, 0x03, 0x48, 0x85, 0xc9, 0x74, 0x36, 0x48, 0x8b, 0x01, 0xff,
+];
 
 fn report_hook_panic(site: &str) {
     if !LOGGED_HOOK_PANIC.swap(true, Ordering::Relaxed) {
@@ -556,9 +573,59 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
         installed_count += 1;
     }
 
+    if pools.has_any_ship_edits() {
+        init_custom_ship_dirs(pools.ship_dirs.clone());
+        install_ship_lib_resolver(
+            module,
+            &mut session,
+            RENDER_SHIP_PHOTO_LIB_RVA,
+            RENDER_SHIP_PHOTO_LIB_RESUME_RVA,
+            RENDER_SHIP_PHOTO_LIB_STOLEN,
+            &RENDER_SHIP_PHOTO_LIB_GUARD,
+            "renderShipPhoto LIB_SHIPS",
+        )?;
+        install_ship_lib_resolver(
+            module,
+            &mut session,
+            CLONE_DESIGN_LIB_RVA,
+            CLONE_DESIGN_LIB_RESUME_RVA,
+            CLONE_DESIGN_LIB_STOLEN,
+            &CLONE_DESIGN_LIB_GUARD,
+            "Ship_CloneDesignAndInit LIB_SHIPS",
+        )?;
+        installed_count += 2;
+    }
+
     let _ = RESOLVED_POOLS.set(pools);
     session.install_permanently().map_err(|e| e.to_string())?;
     Ok(installed_count)
+}
+
+unsafe fn install_ship_lib_resolver(
+    module: ProcessModule,
+    session: &mut PatchSession,
+    rva: usize,
+    resume_rva: usize,
+    stolen: usize,
+    guard: &[u8; 16],
+    label: &str,
+) -> Result<(), String> {
+    let addr = verify_site_bytes(module, rva, guard, label)?;
+    let resume = module.resolve_rva(resume_rva).map_err(|e| e.to_string())?;
+    let mut tramp = Trampoline::new();
+    // `RDX` holds `name_cstr`; pass `RDX` -> `RCX` and receive `Node*` in `RAX`.
+    tramp.preserved_call(
+        resolve_ship_library_for_name as *const (),
+        &[0x48, 0x89, 0xd1], // MOV RCX, RDX
+        &[],
+        ReturnType::Rax,
+    );
+    tramp.bytes(&[0x48, 0x89, 0xc1]); // MOV RCX, RAX
+    tramp.absolute_jump(resume);
+    session
+        .detour_trampoline(addr, stolen, tramp)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Which resume the conditional branch targets after `CMP reg, count`.

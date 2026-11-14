@@ -3,11 +3,222 @@
 //! Maps the eight top-level `escadra.json` categories (plus optional sub-pools)
 //! onto HighFleet's internal sub-tables using deterministic `replace` -> `remove` -> `add` rules.
 
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::CString;
+use std::path::Path;
 
 use crate::config::{parse_count_field, Config, CountOp, PoolConfig, ShipworksConfig};
 use crate::native::DesignConvoyStats;
 use crate::pools;
+
+/// Case-insensitive wildcard matcher supporting `*` and `?`.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let t: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: usize = 0;
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn has_wildcard(s: &str) -> bool {
+    s.contains('*') || s.contains('?')
+}
+
+fn scan_seria_stems(dir: &str, pattern: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut stems = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_seria = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("seria"));
+        if !is_seria {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if glob_match(pattern, stem) {
+            stems.push(stem.to_string());
+        }
+    }
+    stems.sort();
+    stems
+}
+
+fn strip_seria_suffix(s: &str) -> &str {
+    if s.len() > 6 && s[s.len() - 6..].eq_ignore_ascii_case(".seria") {
+        &s[..s.len() - 6]
+    } else {
+        s
+    }
+}
+
+/// Expands `@group` references and `*` / `?` wildcards in `escadra.json` lists,
+/// and records any explicit subdirectories referenced in path-qualified tokens.
+struct DesignExpansionContext<'a> {
+    groups: &'a BTreeMap<String, Vec<String>>,
+    ship_dirs: Vec<String>,
+}
+
+impl<'a> DesignExpansionContext<'a> {
+    fn new(config: &'a Config) -> Self {
+        let mut ship_dirs = Vec::new();
+        for dir in &config.ship_dirs {
+            let norm = dir
+                .trim()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_string();
+            if !norm.is_empty() && !ship_dirs.iter().any(|d| d == &norm) {
+                ship_dirs.push(norm);
+            }
+        }
+        Self {
+            groups: &config.groups,
+            ship_dirs,
+        }
+    }
+
+    fn register_dir(&mut self, dir: &str) {
+        let norm = dir
+            .trim()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string();
+        if !norm.is_empty() && !self.ship_dirs.iter().any(|d| d == &norm) {
+            self.ship_dirs.push(norm);
+        }
+    }
+
+    fn expand_groups(
+        &self,
+        raw_items: &[String],
+        visited: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        for raw in raw_items {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(group_name) = trimmed.strip_prefix('@') {
+                let group_key = group_name.trim();
+                if !visited.insert(group_key.to_string()) {
+                    log::error!("hf_hee: cyclic group reference \"@{group_key}\"");
+                    continue;
+                }
+                if let Some(members) = self.groups.get(group_key) {
+                    self.expand_groups(members, visited, out);
+                } else {
+                    log::warn!("hf_hee: unknown group \"@{group_key}\" in escadra.json");
+                }
+                visited.remove(group_key);
+            } else {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+
+    fn expand_add_list(&mut self, raw_items: &[String]) -> Vec<String> {
+        let mut tokens = Vec::new();
+        self.expand_groups(raw_items, &mut HashSet::new(), &mut tokens);
+
+        let mut out = Vec::new();
+        for token in tokens {
+            let norm = token.replace('\\', "/");
+            if let Some((raw_dir, raw_file)) = norm.rsplit_once('/') {
+                let dir = raw_dir.trim_end_matches('/');
+                let pat = strip_seria_suffix(raw_file.trim());
+                let pat = if pat.is_empty() { "*" } else { pat };
+                if !dir.is_empty() {
+                    self.register_dir(dir);
+                }
+                if has_wildcard(pat) {
+                    let matched = scan_seria_stems(dir, pat);
+                    if matched.is_empty() {
+                        log::warn!("hf_hee: wildcard \"{token}\" matched 0 .seria files");
+                    } else {
+                        log::info!("hf_hee: wildcard \"{token}\" -> {} ship(s)", matched.len());
+                    }
+                    out.extend(matched);
+                } else {
+                    out.push(pat.to_string());
+                }
+                continue;
+            }
+
+            let pat = strip_seria_suffix(&norm);
+            if has_wildcard(pat) {
+                let mut matched = Vec::new();
+                let mut seen = HashSet::new();
+                for dir in &self.ship_dirs {
+                    for stem in scan_seria_stems(dir, pat) {
+                        if seen.insert(stem.clone()) {
+                            matched.push(stem);
+                        }
+                    }
+                }
+                for stem in scan_seria_stems("Objects/Designs", pat) {
+                    if seen.insert(stem.clone()) {
+                        matched.push(stem);
+                    }
+                }
+                matched.sort();
+                if matched.is_empty() {
+                    log::warn!("hf_hee: wildcard \"{token}\" matched 0 .seria files");
+                } else {
+                    log::info!("hf_hee: wildcard \"{token}\" -> {} ship(s)", matched.len());
+                }
+                out.extend(matched);
+            } else {
+                out.push(pat.to_string());
+            }
+        }
+        out
+    }
+
+    fn expand_remove_patterns(&self, raw_items: &[String]) -> Vec<String> {
+        let mut tokens = Vec::new();
+        self.expand_groups(raw_items, &mut HashSet::new(), &mut tokens);
+        tokens
+            .into_iter()
+            .map(|t| {
+                let norm = t.replace('\\', "/");
+                let leaf = Path::new(&norm)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&norm);
+                strip_seria_suffix(leaf).to_string()
+            })
+            .collect()
+    }
+}
 
 /// Pre-sanitized ship design entry with both its UTF-8 name and a null-terminated
 /// `CString` ready for zero-allocation native `LIB_SHIPS` lookups at spawn time.
@@ -72,6 +283,10 @@ pub struct SgWaveCounts {
 
 /// Resolved ship lists for every native hook site, derived from `escadra.json`.
 pub struct ResolvedPools {
+    /// Ordered list of custom ship directories (`config.ship_dirs` plus any
+    /// explicit directories from path-qualified wildcards/entries).
+    pub ship_dirs: Vec<String>,
+
     pub sg_edited: bool,
     pub sg_flagships_normal: Vec<PoolEntry>,
     pub sg_flagships_hard: Vec<PoolEntry>,
@@ -135,20 +350,32 @@ pub struct ResolvedPools {
     pub shipworks_auto_adds: Vec<PoolEntry>,
 }
 
-/// Applies `replace` -> `remove` -> `add` to a vanilla `&[&str]` slice.
+/// Applies `replace` -> `remove` -> `add` to a vanilla `&[&str]` slice,
+/// expanding `@group` references and `*`/`?` wildcards.
 ///
-/// Removing a name drops **all** occurrences matching `cfg.remove` (so removing
-/// `"Fearsome"` or `"Kastor"` from a pool where vanilla pushed it twice drops both).
-pub fn resolve_pool(vanilla: &[&str], cfg: &PoolConfig) -> Vec<PoolEntry> {
+/// Removing a name (or wildcard like `"Gladiator*"`) drops **all** matching occurrences.
+fn resolve_pool_with_ctx(
+    vanilla: &[&str],
+    cfg: &PoolConfig,
+    ctx: &mut DesignExpansionContext<'_>,
+) -> Vec<PoolEntry> {
     let base: Vec<String> = match &cfg.replace {
-        Some(replacement) => replacement.clone(),
+        Some(replacement) => ctx.expand_add_list(replacement),
         None => vanilla.iter().map(|s| (*s).to_string()).collect(),
     };
+    let remove_patterns = ctx.expand_remove_patterns(&cfg.remove);
+    let added_names = ctx.expand_add_list(&cfg.add);
 
-    let mut items: Vec<PoolEntry> = Vec::with_capacity(base.len() + cfg.add.len());
+    let mut items: Vec<PoolEntry> = Vec::with_capacity(base.len() + added_names.len());
     for candidate in base {
         let trimmed = candidate.trim();
-        let is_removed = cfg.remove.iter().any(|rem| rem.trim() == trimmed);
+        let is_removed = remove_patterns.iter().any(|pat| {
+            if has_wildcard(pat) {
+                glob_match(pat, trimmed)
+            } else {
+                pat == trimmed
+            }
+        });
         if is_removed {
             continue;
         }
@@ -157,8 +384,8 @@ pub fn resolve_pool(vanilla: &[&str], cfg: &PoolConfig) -> Vec<PoolEntry> {
         }
     }
 
-    for added in &cfg.add {
-        if let Some(entry) = PoolEntry::new(added) {
+    for added in added_names {
+        if let Some(entry) = PoolEntry::new(&added) {
             items.push(entry);
         }
     }
@@ -178,17 +405,17 @@ struct ShipworksPools {
     auto_adds: Vec<PoolEntry>,
 }
 
-fn resolve_shipworks(sw: &ShipworksConfig, garrison_sync: Option<&PoolConfig>) -> ShipworksPools {
-    let mut flat_remove = sw.base.remove.clone();
-    let mut auto_add_names = sw.base.add.clone();
+fn resolve_shipworks(
+    sw: &ShipworksConfig,
+    garrison_sync: Option<&PoolConfig>,
+    ctx: &mut DesignExpansionContext<'_>,
+) -> ShipworksPools {
+    let mut flat_remove = ctx.expand_remove_patterns(&sw.base.remove);
+    let mut auto_add_names = ctx.expand_add_list(&sw.base.add);
 
     if let Some(gs) = garrison_sync {
-        for r in &gs.remove {
-            flat_remove.push(r.clone());
-        }
-        for a in &gs.add {
-            auto_add_names.push(a.clone());
-        }
+        flat_remove.extend(ctx.expand_remove_patterns(&gs.remove));
+        auto_add_names.extend(ctx.expand_add_list(&gs.add));
     }
 
     // When `sw.base.replace` is set and a bucket has no explicit override, replace
@@ -196,9 +423,18 @@ fn resolve_shipworks(sw: &ShipworksConfig, garrison_sync: Option<&PoolConfig>) -
     // and receive auto-classified entries from `sw.base.replace` + `add`).
     let base_replace_active = sw.base.replace.is_some();
     if let Some(rep) = &sw.base.replace {
-        let mut combined: Vec<String> = rep
+        let expanded_rep = ctx.expand_add_list(rep);
+        let mut combined: Vec<String> = expanded_rep
             .iter()
-            .filter(|cand| !flat_remove.iter().any(|rem| rem.trim() == cand.trim()))
+            .filter(|cand| {
+                !flat_remove.iter().any(|pat| {
+                    if has_wildcard(pat) {
+                        glob_match(pat, cand.trim())
+                    } else {
+                        pat == cand.trim()
+                    }
+                })
+            })
             .cloned()
             .collect();
         combined.extend(auto_add_names);
@@ -222,20 +458,20 @@ fn resolve_shipworks(sw: &ShipworksConfig, garrison_sync: Option<&PoolConfig>) -
     };
 
     let small = match &sw.small {
-        Some(cfg) => resolve_pool(pools::VANILLA_SHIPWORKS_SMALL, cfg),
-        None => resolve_pool(pools::VANILLA_SHIPWORKS_SMALL, default_bucket_cfg),
+        Some(cfg) => resolve_pool_with_ctx(pools::VANILLA_SHIPWORKS_SMALL, cfg, ctx),
+        None => resolve_pool_with_ctx(pools::VANILLA_SHIPWORKS_SMALL, default_bucket_cfg, ctx),
     };
     let mid = match &sw.mid {
-        Some(cfg) => resolve_pool(pools::VANILLA_SHIPWORKS_MID, cfg),
-        None => resolve_pool(pools::VANILLA_SHIPWORKS_MID, default_bucket_cfg),
+        Some(cfg) => resolve_pool_with_ctx(pools::VANILLA_SHIPWORKS_MID, cfg, ctx),
+        None => resolve_pool_with_ctx(pools::VANILLA_SHIPWORKS_MID, default_bucket_cfg, ctx),
     };
     let large = match &sw.large {
-        Some(cfg) => resolve_pool(pools::VANILLA_SHIPWORKS_LARGE, cfg),
-        None => resolve_pool(pools::VANILLA_SHIPWORKS_LARGE, default_bucket_cfg),
+        Some(cfg) => resolve_pool_with_ctx(pools::VANILLA_SHIPWORKS_LARGE, cfg, ctx),
+        None => resolve_pool_with_ctx(pools::VANILLA_SHIPWORKS_LARGE, default_bucket_cfg, ctx),
     };
     let carrier = match &sw.carrier {
-        Some(cfg) => resolve_pool(pools::VANILLA_SHIPWORKS_CARRIER, cfg),
-        None => resolve_pool(pools::VANILLA_SHIPWORKS_CARRIER, default_bucket_cfg),
+        Some(cfg) => resolve_pool_with_ctx(pools::VANILLA_SHIPWORKS_CARRIER, cfg, ctx),
+        None => resolve_pool_with_ctx(pools::VANILLA_SHIPWORKS_CARRIER, default_bucket_cfg, ctx),
     };
 
     let auto_adds: Vec<PoolEntry> = auto_add_names
@@ -254,6 +490,7 @@ fn resolve_shipworks(sw: &ShipworksConfig, garrison_sync: Option<&PoolConfig>) -
 
 impl ResolvedPools {
     pub fn from_config(config: &Config) -> Self {
+        let mut ctx = DesignExpansionContext::new(config);
         let empty = PoolConfig::default();
         let sg = &config.strikegroups;
         let tm = &config.tactical_missile;
@@ -420,87 +657,143 @@ impl ResolvedPools {
             .then_some(garrisons_campaign_cfg);
         let shipworks_edited =
             !config.shipworks.is_empty() || garrison_sync.is_some_and(|gs| !gs.is_empty());
-        let shipworks = resolve_shipworks(&config.shipworks, garrison_sync);
+        let shipworks = resolve_shipworks(&config.shipworks, garrison_sync, &mut ctx);
+
+        let sg_flagships_normal = resolve_pool_with_ctx(
+            pools::VANILLA_SG_FLAGSHIPS_NORMAL,
+            select_sub(&sg.flagships_normal, &sg.base),
+            &mut ctx,
+        );
+        let sg_flagships_hard = resolve_pool_with_ctx(
+            pools::VANILLA_SG_FLAGSHIPS_HARD,
+            select_sub(&sg.flagships_hard, &sg.base),
+            &mut ctx,
+        );
+        let sg_ships_normal = resolve_pool_with_ctx(
+            pools::VANILLA_SG_SHIPS_NORMAL,
+            select_sub(&sg.fill_normal, &sg.base),
+            &mut ctx,
+        );
+        let sg_ships_hard = resolve_pool_with_ctx(
+            pools::VANILLA_SG_SHIPS_HARD,
+            select_sub(&sg.fill_hard, &sg.base),
+            &mut ctx,
+        );
+        let sg_extra_missile =
+            resolve_pool_with_ctx(pools::VANILLA_SG_EXTRA_MISSILE, sg_missile_cfg, &mut ctx);
+        let sg_extra_carriers =
+            resolve_pool_with_ctx(pools::VANILLA_SG_EXTRA_CARRIERS, sg_carrier_cfg, &mut ctx);
+        let sg_extra_khiva =
+            resolve_pool_with_ctx(pools::VANILLA_SG_EXTRA_KHIVA, sg_khiva_cfg, &mut ctx);
+        let sg_endgame_rider =
+            resolve_pool_with_ctx(pools::VANILLA_SG_ENDGAME_RIDER, sg_rider_cfg, &mut ctx);
+        let garrisons_campaign =
+            resolve_pool_with_ctx(pools::VANILLA_GARRISONS, garrisons_campaign_cfg, &mut ctx);
+        let garrisons_endgame =
+            resolve_pool_with_ctx(pools::VANILLA_GARRISONS, garrisons_endgame_cfg, &mut ctx);
+        let mercs_cities_campaign = resolve_pool_with_ctx(
+            pools::VANILLA_MERCS_CITIES_CAMPAIGN,
+            mercs_hire_cfg,
+            &mut ctx,
+        );
+        let mercs_cities_endgame = resolve_pool_with_ctx(
+            pools::VANILLA_MERCS_CITIES_ENDGAME,
+            mercs_endgame_cfg,
+            &mut ctx,
+        );
+        let pool_1_dead = resolve_pool_with_ctx(pools::VANILLA_DEAD_POOL_1, &empty, &mut ctx);
+        let pool_3_dead = resolve_pool_with_ctx(pools::VANILLA_DEAD_POOL_3, &empty, &mut ctx);
+        let tactical_air = resolve_pool_with_ctx(
+            pools::VANILLA_TACTICAL_AIR,
+            &config.tactical_air.base,
+            &mut ctx,
+        );
+        let tactical_missile_ships = resolve_pool_with_ctx(
+            pools::VANILLA_TACTICAL_MISSILE_SHIPS,
+            tm_ships_cfg,
+            &mut ctx,
+        );
+        let tactical_missile_escorts = resolve_pool_with_ctx(
+            pools::VANILLA_TACTICAL_MISSILE_ESCORTS,
+            tm_escorts_cfg,
+            &mut ctx,
+        );
+        let tarkhans_campaign = resolve_pool_with_ctx(
+            pools::VANILLA_TARKHANS_CAMPAIGN,
+            tarkhan_campaign_cfg,
+            &mut ctx,
+        );
+        let tarkhans_khiva_groups = [
+            resolve_pool_with_ctx(pools::VANILLA_TARKHANS_KHIVA_GROUP1, tk_g1_cfg, &mut ctx),
+            resolve_pool_with_ctx(pools::VANILLA_TARKHANS_KHIVA_GROUP2, tk_g2_cfg, &mut ctx),
+            resolve_pool_with_ctx(pools::VANILLA_TARKHANS_KHIVA_GROUP3, tk_g3_cfg, &mut ctx),
+            resolve_pool_with_ctx(pools::VANILLA_TARKHANS_KHIVA_GROUP4, tk_g4_cfg, &mut ctx),
+        ];
+        let reinforcements_tier0 = resolve_pool_with_ctx(
+            pools::VANILLA_MERCS_REINFORCEMENTS_TIER0,
+            reinf_t0_cfg,
+            &mut ctx,
+        );
+        let reinforcements_tier1 = resolve_pool_with_ctx(
+            pools::VANILLA_MERCS_REINFORCEMENTS_TIER1,
+            reinf_t1_cfg,
+            &mut ctx,
+        );
+        let traders_ships =
+            resolve_pool_with_ctx(pools::VANILLA_TRADERS_SHIPS, traders_ships_cfg, &mut ctx);
+        let traders_escorts = resolve_pool_with_ctx(
+            pools::VANILLA_TRADERS_ESCORTS,
+            traders_escorts_cfg,
+            &mut ctx,
+        );
+        let traders_escorts_hard = resolve_pool_with_ctx(
+            pools::VANILLA_TRADERS_ESCORTS_HARD,
+            traders_escorts_hard_cfg,
+            &mut ctx,
+        );
 
         Self {
+            ship_dirs: ctx.ship_dirs,
             sg_edited,
-            sg_flagships_normal: resolve_pool(
-                pools::VANILLA_SG_FLAGSHIPS_NORMAL,
-                select_sub(&sg.flagships_normal, &sg.base),
-            ),
-            sg_flagships_hard: resolve_pool(
-                pools::VANILLA_SG_FLAGSHIPS_HARD,
-                select_sub(&sg.flagships_hard, &sg.base),
-            ),
-            sg_ships_normal: resolve_pool(
-                pools::VANILLA_SG_SHIPS_NORMAL,
-                select_sub(&sg.fill_normal, &sg.base),
-            ),
-            sg_ships_hard: resolve_pool(
-                pools::VANILLA_SG_SHIPS_HARD,
-                select_sub(&sg.fill_hard, &sg.base),
-            ),
-            sg_extra_missile: resolve_pool(pools::VANILLA_SG_EXTRA_MISSILE, sg_missile_cfg),
-            sg_extra_carriers: resolve_pool(pools::VANILLA_SG_EXTRA_CARRIERS, sg_carrier_cfg),
-            sg_extra_khiva: resolve_pool(pools::VANILLA_SG_EXTRA_KHIVA, sg_khiva_cfg),
+            sg_flagships_normal,
+            sg_flagships_hard,
+            sg_ships_normal,
+            sg_ships_hard,
+            sg_extra_missile,
+            sg_extra_carriers,
+            sg_extra_khiva,
 
             sg_rider_edited,
-            sg_endgame_rider: resolve_pool(pools::VANILLA_SG_ENDGAME_RIDER, sg_rider_cfg),
+            sg_endgame_rider,
 
             spawn_ships_edited,
-            garrisons_campaign: resolve_pool(pools::VANILLA_GARRISONS, garrisons_campaign_cfg),
-            garrisons_endgame: resolve_pool(pools::VANILLA_GARRISONS, garrisons_endgame_cfg),
-            mercs_cities_campaign: resolve_pool(
-                pools::VANILLA_MERCS_CITIES_CAMPAIGN,
-                mercs_hire_cfg,
-            ),
-            mercs_cities_endgame: resolve_pool(
-                pools::VANILLA_MERCS_CITIES_ENDGAME,
-                mercs_endgame_cfg,
-            ),
-            pool_1_dead: resolve_pool(pools::VANILLA_DEAD_POOL_1, &empty),
-            pool_3_dead: resolve_pool(pools::VANILLA_DEAD_POOL_3, &empty),
+            garrisons_campaign,
+            garrisons_endgame,
+            mercs_cities_campaign,
+            mercs_cities_endgame,
+            pool_1_dead,
+            pool_3_dead,
 
-            tactical_air: resolve_pool(pools::VANILLA_TACTICAL_AIR, &config.tactical_air.base),
+            tactical_air,
 
             tactical_missile_edited,
-            tactical_missile_ships: resolve_pool(
-                pools::VANILLA_TACTICAL_MISSILE_SHIPS,
-                tm_ships_cfg,
-            ),
-            tactical_missile_escorts: resolve_pool(
-                pools::VANILLA_TACTICAL_MISSILE_ESCORTS,
-                tm_escorts_cfg,
-            ),
+            tactical_missile_ships,
+            tactical_missile_escorts,
 
             tarkhan_campaign_edited,
-            tarkhans_campaign: resolve_pool(pools::VANILLA_TARKHANS_CAMPAIGN, tarkhan_campaign_cfg),
+            tarkhans_campaign,
 
             tarkhan_khiva_edited,
-            tarkhans_khiva_groups: [
-                resolve_pool(pools::VANILLA_TARKHANS_KHIVA_GROUP1, tk_g1_cfg),
-                resolve_pool(pools::VANILLA_TARKHANS_KHIVA_GROUP2, tk_g2_cfg),
-                resolve_pool(pools::VANILLA_TARKHANS_KHIVA_GROUP3, tk_g3_cfg),
-                resolve_pool(pools::VANILLA_TARKHANS_KHIVA_GROUP4, tk_g4_cfg),
-            ],
+            tarkhans_khiva_groups,
 
             reinforcements_edited,
-            reinforcements_tier0: resolve_pool(
-                pools::VANILLA_MERCS_REINFORCEMENTS_TIER0,
-                reinf_t0_cfg,
-            ),
-            reinforcements_tier1: resolve_pool(
-                pools::VANILLA_MERCS_REINFORCEMENTS_TIER1,
-                reinf_t1_cfg,
-            ),
+            reinforcements_tier0,
+            reinforcements_tier1,
 
             traders_edited,
-            traders_ships: resolve_pool(pools::VANILLA_TRADERS_SHIPS, traders_ships_cfg),
-            traders_escorts: resolve_pool(pools::VANILLA_TRADERS_ESCORTS, traders_escorts_cfg),
-            traders_escorts_hard: resolve_pool(
-                pools::VANILLA_TRADERS_ESCORTS_HARD,
-                traders_escorts_hard_cfg,
-            ),
+            traders_ships,
+            traders_escorts,
+            traders_escorts_hard,
             traders_count,
             sg_wave_counts,
             sg_sprinkle: sg.sprinkle,
@@ -516,8 +809,8 @@ impl ResolvedPools {
         }
     }
 
-    /// True when at least one pool in `escadra.json` differs from vanilla.
-    pub fn has_any_edits(&self) -> bool {
+    /// True when at least one pool's ship roster is edited.
+    pub fn has_any_ship_edits(&self) -> bool {
         self.sg_edited
             || self.sg_rider_edited
             || self.spawn_ships_edited
@@ -526,6 +819,11 @@ impl ResolvedPools {
             || self.reinforcements_edited
             || self.traders_edited
             || self.shipworks_edited
+    }
+
+    /// True when at least one pool in `escadra.json` differs from vanilla.
+    pub fn has_any_edits(&self) -> bool {
+        self.has_any_ship_edits()
             || self.traders_count.is_some()
             || self.sg_wave_counts.is_some()
             || self.sg_sprinkle
