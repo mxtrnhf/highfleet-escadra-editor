@@ -49,30 +49,37 @@
 //!    with a uniformly random eligible city (same `+0x2e8 >= 2` / `+0x248 != 0`
 //!    filters as the vanilla scan), so high `count` values spread across the map.
 
+use std::collections::HashMap;
 use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use patchy::{Condition, PatchSession, ProcessModule, ReturnType, Trampoline};
 
+use crate::config::ShipCount;
 use crate::native::{
     assign_existing_escadra_string, clear_game_string_vec, create_escadra_from_ships,
     destroy_game_string_vec, get_profile, hge_rand_float, hge_rand_int, init_custom_ship_dirs,
     init_uninitialized_escadra_string_cstr, is_endwar, is_far_from_ur_or_hard, is_hard_mode,
-    lookup_design_convoy_stats, lookup_design_shipworks_stats, lookup_design_strength,
-    mark_first_matching_ship_as_prize, push_game_string, read_checked,
-    resolve_ship_library_for_name, RawEscadraString, RawStringVec, Vec2, LOCATION_FLAG_OFFSET,
-    LOCATION_KIND_STATE_OFFSET, NPC_SHIP_FIRST_OFFSET, PROFILE_LOCATIONS_OFFSET,
+    lookup_design_convoy_stats, lookup_design_creature, lookup_design_shipworks_stats,
+    lookup_design_strength, lookup_design_strength_checked, mark_first_matching_ship_as_prize,
+    push_game_string, read_checked, resolve_ship_library_for_name, RawEscadraString, RawStringVec,
+    Vec2, LOCATION_FLAG_OFFSET, LOCATION_KIND_STATE_OFFSET, NPC_SHIP_FIRST_OFFSET,
+    PROFILE_LOCATIONS_OFFSET,
 };
 use crate::pool_math::{
     classify_shipworks_bucket, convoy_can_support_escort, roll_spawn_ships_indices,
-    roll_strikegroup_indices, PoolEntry, ResolvedPools, ShipworksBucket,
+    roll_strikegroup_indices, top_up_draft, PoolEntry, ResolvedPools, ShipworksBucket,
 };
 use crate::pools;
 
 static RESOLVED_POOLS: OnceLock<ResolvedPools> = OnceLock::new();
 static LOGGED_HOOK_PANIC: AtomicBool = AtomicBool::new(false);
+// The two consecutive outer-wave loops build fleets and then attach their
+// reserved riders. The key is the fleet's identity, never dereferenced here.
+static PENDING_SG_RIDERS: LazyLock<Mutex<HashMap<usize, &'static PoolEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const SPAWN_SHIPS_RVA: usize = 0x203b80;
 const SPAWN_SHIPS_STOLEN: usize = 7;
@@ -92,6 +99,23 @@ const SG_RIDER_STOLEN: usize = 15;
 const SG_RIDER_GUARD: [u8; 15] = [
     0x48, 0x8d, 0x0d, 0x40, 0xae, 0x10, 0x00, 0x66, 0x0f, 0x2f, 0xf1, 0x48, 0x0f, 0x47, 0xcf,
 ];
+
+// Outer SGs alone pass 0 at this call site. Tag them with 2 so the bounded
+// builder can budget a rider slot without confusing them with campaign SGs.
+const SG_OUTER_TAG: u8 = 2;
+const SG_OUTER_TAG_RVA: usize = 0x2628c2;
+const SG_OUTER_TAG_GUARD: [u8; 5] = [0xc6, 0x44, 0x24, 0x20, 0x00];
+// Phase 3 has set the fleet flag at +0x19c and holds its address in R14.
+// Keep the native late clone/attach so the rider is added after the fuel burn.
+const SG_SIZED_RIDER_RVA: usize = 0x2629fa;
+const SG_SIZED_RIDER_GUARD: [u8; 7] = [0x48, 0x8b, 0x0d, 0xdf, 0xef, 0x7a, 0x03];
+const SG_SIZED_RIDER_SKIP_RVA: usize = 0x262a99;
+
+// Campaign pool 2's caller limits the number of NPC records it creates from
+// the already-built names vector. Pool 4's separate FOR_JOIN cap is untouched.
+const HIRE_OFFER_CAP_RVA: usize = 0x2a8347;
+const HIRE_OFFER_CAP_GUARD: [u8; 8] = [0xc7, 0x44, 0x24, 0x74, 0x05, 0, 0, 0];
+const VANILLA_HIRE_OFFER_CAP: i32 = 5;
 
 const TARKHAN_SWITCH_RVA: usize = 0x28f695;
 const TARKHAN_SWITCH_RESUME_RVA: usize = 0x28f783;
@@ -245,7 +269,7 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
     let mut session = PatchSession::new();
     let mut installed_count = 0usize;
 
-    if pools.spawn_ships_edited {
+    if pools.spawn_ships_edited || pools.has_spawn_ship_count() {
         let addr = verify_site_bytes(
             module,
             SPAWN_SHIPS_RVA,
@@ -253,6 +277,25 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
             "somethingSpawnShips",
         )?;
         let mut tramp = Trampoline::new();
+        if !pools.spawn_ships_edited {
+            // A size-only edit should leave unrelated callers (notably pool 4
+            // FOR_JOIN) in the native draft. R8D is the pool argument.
+            let custom = tramp.new_label();
+            if pools.garrison_ship_count.is_some()
+                || pools.tactical_air_ship_count.is_some()
+                || pools.tactical_missile_ship_count.is_some()
+            {
+                tramp.bytes(&[0x45, 0x85, 0xc0]); // TEST R8D, R8D
+                tramp.jump_if(Condition::Equal, custom);
+            }
+            if pools.hire_ship_count.is_some() {
+                tramp.bytes(&[0x41, 0x83, 0xf8, 0x02]); // CMP R8D, 2
+                tramp.jump_if(Condition::Equal, custom);
+            }
+            tramp.bytes(&SPAWN_SHIPS_GUARD[..SPAWN_SHIPS_STOLEN]);
+            tramp.absolute_jump(addr + SPAWN_SHIPS_STOLEN);
+            tramp.bind(custom).map_err(|e| e.to_string())?;
+        }
         tramp.absolute_jump(detour_spawn_ships as *const () as usize);
         session
             .detour_trampoline(addr, SPAWN_SHIPS_STOLEN, tramp)
@@ -260,7 +303,7 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
         installed_count += 1;
     }
 
-    if pools.sg_edited {
+    if pools.sg_edited || pools.sg_ship_count.is_some() {
         let addr = verify_site_bytes(
             module,
             STRIKEGROUPS_RVA,
@@ -275,7 +318,21 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
         installed_count += 1;
     }
 
-    if pools.sg_rider_edited {
+    if pools.sg_ship_count.is_some() {
+        let mut tag = SG_OUTER_TAG_GUARD;
+        tag[4] = SG_OUTER_TAG;
+        install_inline_replacement(
+            module,
+            &mut session,
+            SG_OUTER_TAG_RVA,
+            &SG_OUTER_TAG_GUARD,
+            &tag,
+            SG_OUTER_TAG_RVA + tag.len(),
+            "outer SG builder tag",
+        )?;
+        install_sized_sg_rider(module, &mut session)?;
+        installed_count += 2;
+    } else if pools.sg_rider_edited {
         let addr = verify_site_bytes(
             module,
             SG_RIDER_RVA,
@@ -294,6 +351,24 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
         session
             .detour_trampoline(addr, SG_RIDER_STOLEN, tramp)
             .map_err(|e| e.to_string())?;
+        installed_count += 1;
+    }
+
+    if let Some(bounds) = pools
+        .hire_ship_count
+        .filter(|bounds| bounds.max > VANILLA_HIRE_OFFER_CAP)
+    {
+        let mut cap = HIRE_OFFER_CAP_GUARD;
+        cap[4..].copy_from_slice(&bounds.max.to_le_bytes());
+        install_inline_replacement(
+            module,
+            &mut session,
+            HIRE_OFFER_CAP_RVA,
+            &HIRE_OFFER_CAP_GUARD,
+            &cap,
+            HIRE_OFFER_CAP_RVA + cap.len(),
+            "campaign FOR_HIRE NPC offer cap",
+        )?;
         installed_count += 1;
     }
 
@@ -601,6 +676,62 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
     Ok(installed_count)
 }
 
+unsafe fn install_inline_replacement(
+    module: ProcessModule,
+    session: &mut PatchSession,
+    rva: usize,
+    guard: &[u8],
+    code: &[u8],
+    resume_rva: usize,
+    label: &str,
+) -> Result<(), String> {
+    let addr = verify_site_bytes(module, rva, guard, label)?;
+    let resume = module.resolve_rva(resume_rva).map_err(|e| e.to_string())?;
+    let mut tramp = Trampoline::new();
+    tramp.bytes(code);
+    tramp.absolute_jump(resume);
+    session
+        .detour_trampoline(addr, guard.len(), tramp)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+unsafe fn install_sized_sg_rider(
+    module: ProcessModule,
+    session: &mut PatchSession,
+) -> Result<(), String> {
+    let addr = verify_site_bytes(
+        module,
+        SG_SIZED_RIDER_RVA,
+        &SG_SIZED_RIDER_GUARD,
+        "outer SG rider slot",
+    )?;
+    let attach = module
+        .resolve_rva(SG_RIDER_RESUME_RVA)
+        .map_err(|e| e.to_string())?;
+    let skip = module
+        .resolve_rva(SG_SIZED_RIDER_SKIP_RVA)
+        .map_err(|e| e.to_string())?;
+    let mut tramp = Trampoline::new();
+    tramp.preserved_call(
+        take_sized_sg_rider as *const (),
+        &[0x4c, 0x89, 0xf1],
+        &[],
+        ReturnType::Rax,
+    ); // MOV RCX, R14
+    tramp.bytes(&[0x48, 0x85, 0xc0]); // TEST RAX, RAX
+    let no_rider = tramp.new_label();
+    tramp.jump_if(Condition::Equal, no_rider);
+    tramp.bytes(&[0x48, 0x89, 0xc1]); // MOV RCX, RAX (design name for native clone)
+    tramp.absolute_jump(attach);
+    tramp.bind(no_rider).map_err(|e| e.to_string())?;
+    tramp.absolute_jump(skip);
+    session
+        .detour_trampoline(addr, SG_SIZED_RIDER_GUARD.len(), tramp)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 unsafe fn install_ship_lib_resolver(
     module: ProcessModule,
     session: &mut PatchSession,
@@ -772,6 +903,24 @@ unsafe extern "C" fn detour_spawn_ships(
     }
 }
 
+unsafe fn rand_index(len: usize) -> usize {
+    hge_rand_int(0, (len - 1) as i32) as usize
+}
+
+unsafe fn roll_size(bounds: ShipCount) -> usize {
+    hge_rand_int(bounds.min, bounds.max) as usize
+}
+
+unsafe fn priced_designs(entries: &[PoolEntry]) -> (Vec<&PoolEntry>, Vec<f32>) {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let price = lookup_design_strength_checked(entry.c_name.as_ptr())?;
+            (price.is_finite() && price >= 0.0).then_some((entry, price))
+        })
+        .unzip()
+}
+
 unsafe fn run_spawn_ships(
     out_vec: *mut RawStringVec,
     budget: f32,
@@ -824,23 +973,46 @@ unsafe fn run_spawn_ships(
         chance_b
     };
 
-    let prices: Vec<f32> = entries
-        .iter()
-        .map(|entry| lookup_design_strength(entry.c_name.as_ptr()))
-        .collect();
-
-    let picked = roll_spawn_ships_indices(&prices, budget, any_size, false, |len| {
-        hge_rand_int(0, (len - 1) as i32) as usize
-    });
-
-    for idx in picked {
-        push_game_string(out_vec, entries[idx].c_name.as_ptr());
+    let base_bounds = match pool_id {
+        0 => pools.garrison_ship_count,
+        2 => pools.hire_ship_count,
+        _ => None,
+    };
+    if let Some(bounds) = base_bounds {
+        let target = roll_size(bounds);
+        let (entries, prices) = priced_designs(entries);
+        let mut picked =
+            roll_spawn_ships_indices(&prices, budget, any_size, false, target, |len| {
+                rand_index(len)
+            });
+        top_up_draft(&mut picked, &prices, target);
+        for idx in picked {
+            push_game_string(out_vec, entries[idx].c_name.as_ptr());
+        }
+    } else {
+        let prices: Vec<f32> = entries
+            .iter()
+            .map(|entry| lookup_design_strength(entry.c_name.as_ptr()))
+            .collect();
+        let picked =
+            roll_spawn_ships_indices(&prices, budget, any_size, false, usize::MAX, |len| {
+                rand_index(len)
+            });
+        for idx in picked {
+            push_game_string(out_vec, entries[idx].c_name.as_ptr());
+        }
     }
 
     // Post-roll Aircraft Tactical package (`chanceA`, `0x140205925`):
     if hge_rand_float(0.0, 1.0) < chance_a && !pools.tactical_air.is_empty() {
-        let pick = hge_rand_int(0, (pools.tactical_air.len() - 1) as i32) as usize;
-        push_game_string(out_vec, pools.tactical_air[pick].c_name.as_ptr());
+        if let Some(bounds) = pools.tactical_air_ship_count {
+            let target = roll_size(bounds);
+            let carriers = available_designs(&pools.tactical_air);
+            append_random_designs(out_vec, &carriers, target);
+        } else {
+            let pick = rand_index(pools.tactical_air.len());
+            push_game_string(out_vec, pools.tactical_air[pick].c_name.as_ptr());
+        }
     }
 
     // Post-roll Missile Tactical package (`chanceB`, `0x14020596d`):
@@ -849,7 +1021,38 @@ unsafe fn run_spawn_ships(
     }
 }
 
+unsafe fn available_designs(entries: &[PoolEntry]) -> Vec<&PoolEntry> {
+    entries
+        .iter()
+        .filter(|entry| lookup_design_creature(entry.c_name.as_ptr()).is_some())
+        .collect()
+}
+
+unsafe fn append_random_designs(out_vec: *mut RawStringVec, entries: &[&PoolEntry], count: usize) {
+    if entries.is_empty() {
+        return;
+    }
+    for _ in 0..count {
+        let pick = rand_index(entries.len());
+        push_game_string(out_vec, entries[pick].c_name.as_ptr());
+    }
+}
+
 unsafe fn append_tactical_missile_package(out_vec: *mut RawStringVec, pools: &ResolvedPools) {
+    if let Some(bounds) = pools.tactical_missile_ship_count {
+        let target = roll_size(bounds);
+        let ships = available_designs(&pools.tactical_missile_ships);
+        let escorts = available_designs(&pools.tactical_missile_escorts);
+        if ships.is_empty() {
+            append_random_designs(out_vec, &escorts, target);
+        } else {
+            append_random_designs(out_vec, &ships, 1);
+            let escort_count = usize::from(target >= 2 && !escorts.is_empty());
+            append_random_designs(out_vec, &escorts, escort_count);
+            append_random_designs(out_vec, &ships, target - 1 - escort_count);
+        }
+        return;
+    }
     if !pools.tactical_missile_edited {
         // Exact vanilla `chanceB` sequence (`0x140205976`..`0x140205a4c`):
         push_game_string(out_vec, c"Tarantul".as_ptr());
@@ -899,7 +1102,7 @@ unsafe extern "C" fn detour_build_strikegroup(
     typhon_flag: u8,
 ) -> usize {
     match catch_unwind(AssertUnwindSafe(|| {
-        run_build_strikegroup(budget, variant, spawn_pos, escadra_name, typhon_flag != 0)
+        run_build_strikegroup(budget, variant, spawn_pos, escadra_name, typhon_flag)
     })) {
         Ok(escadra) => escadra,
         Err(_) => {
@@ -914,7 +1117,7 @@ unsafe fn run_build_strikegroup(
     variant: f32,
     spawn_pos: *const Vec2,
     escadra_name: *const c_char,
-    typhon_flag: bool,
+    build_tag: u8,
 ) -> usize {
     let Some(pools) = RESOLVED_POOLS.get() else {
         return 0;
@@ -923,17 +1126,28 @@ unsafe fn run_build_strikegroup(
     let hard_mode = is_hard_mode();
     let far_or_hard = is_far_from_ur_or_hard(spawn_pos);
 
-    let flagships = if far_or_hard {
-        &pools.sg_flagships_hard
-    } else {
-        &pools.sg_flagships_normal
-    };
-    let fill_ships = if far_or_hard {
-        &pools.sg_ships_hard
-    } else {
-        &pools.sg_ships_normal
-    };
+    if let Some(bounds) = pools.sg_ship_count {
+        let (mut names_vec, rider) = build_sized_strikegroup_roster(
+            pools,
+            budget,
+            roll_size(bounds),
+            hard_mode,
+            far_or_hard,
+            build_tag,
+        );
+        let escadra =
+            create_escadra_from_ships(&mut names_vec, variant, 5, spawn_pos, escadra_name, 0);
+        destroy_game_string_vec(&mut names_vec);
+        if let Some(rider) = rider.filter(|_| escadra != 0) {
+            PENDING_SG_RIDERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(escadra, rider);
+        }
+        return escadra;
+    }
 
+    let (flagships, fill_ships) = strikegroup_core_pools(pools, far_or_hard);
     let flagship_prices: Vec<f32> = flagships
         .iter()
         .map(|e| lookup_design_strength(e.c_name.as_ptr()))
@@ -944,7 +1158,7 @@ unsafe fn run_build_strikegroup(
         .collect();
 
     let (chosen_flagship, chosen_fill) =
-        roll_strikegroup_indices(&flagship_prices, &fill_prices, budget, |len| {
+        roll_strikegroup_indices(&flagship_prices, &fill_prices, budget, usize::MAX, |len| {
             hge_rand_int(0, (len - 1) as i32) as usize
         });
 
@@ -968,7 +1182,7 @@ unsafe fn run_build_strikegroup(
         push_game_string(&mut names_vec, pools.sg_extra_carriers[idx].c_name.as_ptr());
     }
 
-    if typhon_flag && !pools.sg_extra_khiva.is_empty() {
+    if build_tag != 0 && !pools.sg_extra_khiva.is_empty() {
         let idx = hge_rand_int(0, (pools.sg_extra_khiva.len() - 1) as i32) as usize;
         push_game_string(&mut names_vec, pools.sg_extra_khiva[idx].c_name.as_ptr());
     }
@@ -976,6 +1190,124 @@ unsafe fn run_build_strikegroup(
     let escadra = create_escadra_from_ships(&mut names_vec, variant, 5, spawn_pos, escadra_name, 0);
     destroy_game_string_vec(&mut names_vec);
     escadra
+}
+
+fn strikegroup_core_pools(
+    pools: &ResolvedPools,
+    far_or_hard: bool,
+) -> (&[PoolEntry], &[PoolEntry]) {
+    if far_or_hard {
+        (&pools.sg_flagships_hard, &pools.sg_ships_hard)
+    } else {
+        (&pools.sg_flagships_normal, &pools.sg_ships_normal)
+    }
+}
+
+unsafe fn build_sized_strikegroup_roster(
+    pools: &'static ResolvedPools,
+    budget: f32,
+    target: usize,
+    hard_mode: bool,
+    far_or_hard: bool,
+    build_tag: u8,
+) -> (RawStringVec, Option<&'static PoolEntry>) {
+    let (flagships, fill_ships) = strikegroup_core_pools(pools, far_or_hard);
+    let (flagships, flagship_prices) = priced_designs(flagships);
+    let (fill_ships, fill_prices) = priced_designs(fill_ships);
+    let rider = if build_tag == SG_OUTER_TAG && target > 1 {
+        pick_sized_sg_rider(pools)
+    } else {
+        None
+    };
+    let target = target - usize::from(rider.is_some());
+    let mut extras = Vec::with_capacity(3);
+    if build_tag == 1 {
+        let khiva = available_designs(&pools.sg_extra_khiva);
+        if !khiva.is_empty() {
+            extras.push(khiva[rand_index(khiva.len())]);
+        }
+    }
+    // Preserve a flagship slot before rolling optional extras. For a single
+    // Khiva ship, keep the signature Khiva hull in preference to the flagship.
+    let extra_limit = target - usize::from(!flagships.is_empty());
+    let extra_prob = if hard_mode { 0.50 } else { 0.25 };
+    for list in [
+        far_or_hard.then_some(&pools.sg_extra_missile),
+        Some(&pools.sg_extra_carriers),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if extras.len() >= extra_limit {
+            break;
+        }
+        if !list.is_empty() && hge_rand_float(0.0, 1.0) < extra_prob {
+            let available = available_designs(list);
+            if !available.is_empty() {
+                extras.push(available[rand_index(available.len())]);
+            }
+        }
+    }
+
+    let core_limit = target - extras.len();
+    let (flagship, mut fill) =
+        roll_strikegroup_indices(&flagship_prices, &fill_prices, budget, core_limit, |len| {
+            rand_index(len)
+        });
+    top_up_draft(
+        &mut fill,
+        &fill_prices,
+        core_limit - usize::from(flagship.is_some()),
+    );
+
+    let mut names = RawStringVec::zeroed();
+    let flagship = flagship.map(|idx| flagships[idx]);
+    if let Some(flagship) = flagship {
+        push_game_string(&mut names, flagship.c_name.as_ptr());
+    }
+    for &idx in &fill {
+        push_game_string(&mut names, fill_ships[idx].c_name.as_ptr());
+    }
+    for entry in &extras {
+        push_game_string(&mut names, entry.c_name.as_ptr());
+    }
+    // If fill was explicitly emptied, repeat a hull already in the group.
+    let missing = core_limit - usize::from(flagship.is_some()) - fill.len();
+    if missing == 0 {
+        return (names, rider);
+    }
+    let fallback = if let Some(entry) = flagship.or_else(|| extras.first().copied()) {
+        entry.c_name.as_ptr()
+    } else {
+        // The endgame callers dereference the new fleet unconditionally.
+        log::warn!("hf_hee: no usable Strike Group hulls for ship_count; falling back to Borey");
+        c"Borey".as_ptr()
+    };
+    for _ in 0..missing {
+        push_game_string(&mut names, fallback);
+    }
+    (names, rider)
+}
+
+unsafe fn pick_sized_sg_rider(pools: &ResolvedPools) -> Option<&PoolEntry> {
+    let available = available_designs(&pools.sg_endgame_rider);
+    let &[first, second] = available.as_slice() else {
+        return (!available.is_empty()).then(|| available[rand_index(available.len())]);
+    };
+    let odds = if pools.sg_rider_edited { 0.50 } else { 0.66 };
+    Some(if hge_rand_float(0.0, 1.0) < odds {
+        first
+    } else {
+        second
+    })
+}
+
+extern "C" fn take_sized_sg_rider(escadra: usize) -> *const c_char {
+    PENDING_SG_RIDERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&escadra)
+        .map_or(std::ptr::null(), |rider| rider.c_name.as_ptr())
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,7 +1673,7 @@ unsafe fn run_shipworks_test_offer(
     // Exact `Fleet_SelectShipsForBudget` (`0x140206060`) roll, including its
     // `0x140206892` fallback (`fallback_random_if_empty = true`) when the tested
     // player ship's budget is smaller than every candidate hull in the checked boxes!
-    let picked = roll_spawn_ships_indices(&prices, budget, false, true, |len| {
+    let picked = roll_spawn_ships_indices(&prices, budget, false, true, usize::MAX, |len| {
         hge_rand_int(0, (len - 1) as i32) as usize
     });
 

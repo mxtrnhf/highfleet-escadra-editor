@@ -577,10 +577,13 @@ pub unsafe fn lookup_design_creature(name_cstr: *const c_char) -> Option<usize> 
 
 /// Looks up `name_cstr` in `LIB_SHIPS` or HEE's custom cache and returns `design+0x15f8`.
 pub unsafe fn lookup_design_strength(name_cstr: *const c_char) -> f32 {
-    let Some(creature) = lookup_design_creature(name_cstr) else {
-        return 0.0;
-    };
-    read_checked::<f32>(creature + CREATURE_COMBAT_VALUE_OFFSET).unwrap_or(0.0)
+    lookup_design_strength_checked(name_cstr).unwrap_or(0.0)
+}
+
+/// Like `lookup_design_strength`, but distinguishes a missing design from a zero-strength hull.
+pub unsafe fn lookup_design_strength_checked(name_cstr: *const c_char) -> Option<f32> {
+    let creature = lookup_design_creature(name_cstr)?;
+    read_checked::<f32>(creature + CREATURE_COMBAT_VALUE_OFFSET)
 }
 
 /// Reads fuel/speed stats for `spawnTradeConvoy?` from a `LIB_SHIPS` design.

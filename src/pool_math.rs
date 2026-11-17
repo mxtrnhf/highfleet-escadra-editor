@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::CString;
 use std::path::Path;
 
-use crate::config::{parse_count_field, Config, CountOp, PoolConfig, ShipworksConfig};
+use crate::config::{
+    parse_count_field, parse_ship_count, Config, CountOp, PoolConfig, ShipCount, ShipworksConfig,
+};
 use crate::native::DesignConvoyStats;
 use crate::pools;
 
@@ -340,6 +342,11 @@ pub struct ResolvedPools {
     /// chances (`chanceA` / `chanceB`, pool `0` garrisons only).
     pub tactical_air_count_op: Option<CountOp>,
     pub tactical_missile_count_op: Option<CountOp>,
+    pub sg_ship_count: Option<ShipCount>,
+    pub garrison_ship_count: Option<ShipCount>,
+    pub hire_ship_count: Option<ShipCount>,
+    pub tactical_air_ship_count: Option<ShipCount>,
+    pub tactical_missile_ship_count: Option<ShipCount>,
 
     pub shipworks_edited: bool,
     pub shipworks_small: Vec<PoolEntry>,
@@ -494,6 +501,17 @@ impl ResolvedPools {
         let empty = PoolConfig::default();
         let sg = &config.strikegroups;
         let tm = &config.tactical_missile;
+        let sg_ship_count = parse_ship_count("strikegroups", sg.ship_count.as_ref());
+        let garrison_ship_count =
+            parse_ship_count("garrisons", config.garrisons.ship_count.as_ref());
+        let tactical_air_ship_count =
+            parse_ship_count("tactical_air", config.tactical_air.ship_count.as_ref());
+        let tactical_missile_ship_count =
+            parse_ship_count("tactical_missile", tm.ship_count.as_ref());
+        let hire = config.mercs.hire.as_ref();
+        let hire_ship_count =
+            parse_ship_count("mercs.hire", hire.and_then(|hire| hire.ship_count.as_ref()))
+                .or_else(|| parse_ship_count("mercs", config.mercs.ship_count.as_ref()));
 
         // Strike Group carrier escorts: explicit `strikegroups.carrier_escorts` wins,
         // else syncs with `tactical_air` when edited.
@@ -539,7 +557,10 @@ impl ResolvedPools {
         // Mercs: `hire` (pool 2), `endgame` (pool 4 — also falls back to `garrisons.endgame` if
         // the user put late-game Khiva-defense city ships under `garrisons.endgame` without setting `mercs.endgame`!),
         // and `reinforcements` (`ASK_REINFORCE` tier 1).
-        let mercs_hire_cfg = select_sub(&config.mercs.hire, &config.mercs.base);
+        // A nested size-only hire override should still inherit the flat roster.
+        let mercs_hire_cfg = hire
+            .filter(|hire| hire.ship_count.is_none() || !hire.pool.is_empty())
+            .map_or(&config.mercs.base, |hire| &hire.pool);
         let mercs_endgame_cfg = config
             .mercs
             .endgame
@@ -799,6 +820,11 @@ impl ResolvedPools {
             sg_sprinkle: sg.sprinkle,
             tactical_air_count_op,
             tactical_missile_count_op,
+            sg_ship_count,
+            garrison_ship_count,
+            hire_ship_count,
+            tactical_air_ship_count,
+            tactical_missile_ship_count,
 
             shipworks_edited,
             shipworks_small: shipworks.small,
@@ -824,11 +850,20 @@ impl ResolvedPools {
     /// True when at least one pool in `escadra.json` differs from vanilla.
     pub fn has_any_edits(&self) -> bool {
         self.has_any_ship_edits()
+            || self.sg_ship_count.is_some()
+            || self.has_spawn_ship_count()
             || self.traders_count.is_some()
             || self.sg_wave_counts.is_some()
             || self.sg_sprinkle
             || self.tactical_air_count_op.is_some()
             || self.tactical_missile_count_op.is_some()
+    }
+
+    pub fn has_spawn_ship_count(&self) -> bool {
+        self.garrison_ship_count.is_some()
+            || self.hire_ship_count.is_some()
+            || self.tactical_air_ship_count.is_some()
+            || self.tactical_missile_ship_count.is_some()
     }
 }
 
@@ -839,6 +874,7 @@ pub fn roll_spawn_ships_indices<R>(
     budget: f32,
     any_size: bool,
     fallback_random_if_empty: bool,
+    limit: usize,
     mut rand_index: R,
 ) -> Vec<usize>
 where
@@ -869,7 +905,7 @@ where
         let mut rejects_left: u32 = 10;
         let mut total: f32 = 0.0;
 
-        while total < budget && rejects_left > 0 {
+        while candidate.len() < limit && total < budget && rejects_left > 0 {
             let idx = rand_index(prices.len());
             let next_total = total + prices[idx];
             if next_total > max_allowed {
@@ -923,6 +959,7 @@ pub fn roll_strikegroup_indices<R>(
     flagship_prices: &[f32],
     fill_prices: &[f32],
     budget: f32,
+    limit: usize,
     mut rand_index: R,
 ) -> (Option<usize>, Vec<usize>)
 where
@@ -931,7 +968,7 @@ where
     let mut total: f32 = 0.0;
     let mut chosen_flagship: Option<usize> = None;
 
-    if !flagship_prices.is_empty() {
+    if limit != 0 && !flagship_prices.is_empty() {
         let half_budget = budget * 0.5;
         for (idx, &price) in flagship_prices.iter().enumerate() {
             if price <= half_budget {
@@ -954,8 +991,9 @@ where
 
     let max_allowed = budget + budget * 0.2;
     let mut retries_left: u32 = 10;
+    let fill_limit = limit - usize::from(chosen_flagship.is_some());
 
-    while total < budget && retries_left > 0 {
+    while chosen_fill.len() < fill_limit && total < budget && retries_left > 0 {
         let idx = rand_index(fill_prices.len());
         let next_total = total + fill_prices[idx];
         if next_total >= max_allowed {
@@ -968,6 +1006,17 @@ where
     }
 
     (chosen_flagship, chosen_fill)
+}
+
+/// Top up a bounded draft after the usual budget roll, preferring the cheapest hull.
+/// Repeats are allowed, as in the native draft. Empty pools stay empty.
+pub fn top_up_draft(picked: &mut Vec<usize>, prices: &[f32], target: usize) {
+    if picked.len() >= target {
+        return;
+    }
+    if let Some((idx, _)) = prices.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)) {
+        picked.resize(target, idx);
+    }
 }
 
 /// Exact replica of `spawnTradeConvoy?`'s convoy fuel-range eligibility check

@@ -119,6 +119,31 @@ pub fn parse_count_field(category: &str, field: &Option<String>) -> Option<Count
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShipCount {
+    pub min: i32,
+    pub max: i32,
+}
+
+/// Keep malformed ship_count values local to their field instead of discarding the config.
+pub fn parse_ship_count(path: &str, field: Option<&serde_json::Value>) -> Option<ShipCount> {
+    let field = field?;
+    let bounds = field.as_array().and_then(|items| {
+        let [min, max] = items.as_slice() else {
+            return None;
+        };
+        let min = i32::try_from(min.as_i64()?).ok()?;
+        let max = i32::try_from(max.as_i64()?).ok()?;
+        (0 < min && min <= max).then_some(ShipCount { min, max })
+    });
+    if let Some(ShipCount { min, max }) = bounds {
+        log::info!("hf_hee: {path}.ship_count -> [{min}, {max}]");
+    } else {
+        log::error!("hf_hee: bad {path}.ship_count = {field}; expected [min, max] with positive 32-bit integers and min <= max");
+    }
+    bounds
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -217,6 +242,8 @@ impl PoolConfig {
 pub struct TacticalAirConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ship_count: Option<serde_json::Value>,
     /// Optional group-count adjustment for Air Tactical Groups. Applies to the
     /// per-city `chanceA` spawn probability (vanilla `0.15` normal / `0.20` hard,
     /// `0` near `"UR"` on normal), which is what controls how many air groups
@@ -239,7 +266,7 @@ impl TacticalAirConfig {
     }
 }
 
-fn append_sub_summary(parts: &mut Vec<String>, name: &str, sub: &Option<PoolConfig>) {
+fn append_sub_summary(parts: &mut Vec<String>, name: &str, sub: Option<&PoolConfig>) {
     if let Some(cfg) = sub {
         if !cfg.is_empty() {
             parts.push(format!("{name}({})", cfg.summary()));
@@ -259,7 +286,7 @@ fn summarize_with_subs(base: &PoolConfig, subs: &[(&str, &Option<PoolConfig>)]) 
         parts.push(base.summary());
     }
     for (name, sub) in subs {
-        append_sub_summary(&mut parts, name, sub);
+        append_sub_summary(&mut parts, name, sub.as_ref());
     }
     parts.join("; ")
 }
@@ -269,6 +296,8 @@ fn summarize_with_subs(base: &PoolConfig, subs: &[(&str, &Option<PoolConfig>)]) 
 pub struct StrikeGroupsConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ship_count: Option<serde_json::Value>,
     /// Normal-mode close-to-Ur flagship pool (`[Borey]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flagships_normal: Option<PoolConfig>,
@@ -343,6 +372,8 @@ impl StrikeGroupsConfig {
 pub struct TacticalMissileConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ship_count: Option<serde_json::Value>,
     /// City Missile Tactical Group cruisers (`[Tarantul, Eagle, Tarantul MRL]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ships: Option<PoolConfig>,
@@ -388,6 +419,8 @@ impl TacticalMissileConfig {
 pub struct GarrisonsConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ship_count: Option<serde_json::Value>,
     /// Usual campaign city garrisons (`Profile.endwar == 0`, pool `0`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub campaign: Option<PoolConfig>,
@@ -462,9 +495,12 @@ impl TarkhansConfig {
 pub struct MercsConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
-    /// Paid `FOR_HIRE` pier ships in Mercenary cities (`somethingSpawnShips` pool `2`).
+    /// Shortcut for setting the size of paid FOR_HIRE stock only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hire: Option<PoolConfig>,
+    pub ship_count: Option<serde_json::Value>,
+    /// Paid `FOR_HIRE` pier ships in Mercenary cities (`somethingSpawnShips` pool `2`).
+    #[serde(alias = "for_hire", skip_serializing_if = "Option::is_none")]
+    pub hire: Option<HireConfig>,
     /// Free `FOR_JOIN` pier ships in non-Khiva cities after Nuclear War begins (`pool 4`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endgame: Option<PoolConfig>,
@@ -476,17 +512,35 @@ pub struct MercsConfig {
     pub reinforcements_tier0: Option<PoolConfig>,
 }
 
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct HireConfig {
+    #[serde(flatten)]
+    pub pool: PoolConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ship_count: Option<serde_json::Value>,
+}
+
 impl MercsConfig {
     pub fn summary(&self) -> String {
-        summarize_with_subs(
+        let mut parts = Vec::new();
+        append_sub_summary(
+            &mut parts,
+            "hire",
+            self.hire.as_ref().map(|hire| &hire.pool),
+        );
+        let rest = summarize_with_subs(
             &self.base,
             &[
-                ("hire", &self.hire),
                 ("endgame", &self.endgame),
                 ("reinforcements", &self.reinforcements),
                 ("reinforcements_tier0", &self.reinforcements_tier0),
             ],
-        )
+        );
+        if parts.is_empty() || rest != "vanilla" {
+            parts.push(rest);
+        }
+        parts.join("; ")
     }
 }
 
