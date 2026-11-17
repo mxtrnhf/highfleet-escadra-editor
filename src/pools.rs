@@ -28,11 +28,11 @@ pub const TACTICAL_AIR_BRANCH_RVA: usize = 0x205925;
 pub const TACTICAL_MISSILE_BRANCH_RVA: usize = 0x20596d;
 
 /// `somethingSpawnShips` pool `0`: Campaign City Garrisons.
-pub const GARRISON_POOL_ID: u32 = 0;
+pub const GARRISON_POOL_ID: i32 = 0;
 /// `somethingSpawnShips` pool `2`: Paid `FOR_HIRE` Mercenary City stock.
-pub const MERC_CITIES_CAMPAIGN_POOL_ID: u32 = 2;
+pub const MERC_CITIES_CAMPAIGN_POOL_ID: i32 = 2;
 /// `somethingSpawnShips` pool `4`: Free `FOR_JOIN` Endgame City stock.
-pub const MERC_CITIES_ENDGAME_POOL_ID: u32 = 4;
+pub const MERC_CITIES_ENDGAME_POOL_ID: i32 = 4;
 
 /// `restOfEventsPrologueAntIsaiah` Tarkhan ship switch (`0x28f695`).
 pub const TARKHAN_CAMPAIGN_SWITCH_RVA: usize = 0x28f695;

@@ -543,6 +543,11 @@ pub unsafe extern "C" fn resolve_ship_library_for_name(name_cstr: *const c_char)
 
 /// Resolves `name_cstr` in `LIB_SHIPS` (`0x143a13a70`) or HEE's private custom
 /// ship cache to its root `Creature*`, following `retCreature154c_` (`0x140219980..0x1402199c8`).
+///
+/// # Safety
+/// Call on the game thread while the design library is live. A non-null
+/// `name_cstr` must be readable through the terminator until return. The result
+/// is borrowed game memory and must not be retained across cache reloads.
 pub unsafe fn lookup_design_creature(name_cstr: *const c_char) -> Option<usize> {
     if name_cstr.is_null() {
         return None;
@@ -576,14 +581,14 @@ pub unsafe fn lookup_design_creature(name_cstr: *const c_char) -> Option<usize> 
 }
 
 /// Looks up `name_cstr` in `LIB_SHIPS` or HEE's custom cache and returns `design+0x15f8`.
+///
+/// # Safety
+/// Same requirements as [`lookup_design_creature`]. Only a copied scalar escapes.
 pub unsafe fn lookup_design_strength(name_cstr: *const c_char) -> f32 {
-    lookup_design_strength_checked(name_cstr).unwrap_or(0.0)
-}
-
-/// Like `lookup_design_strength`, but distinguishes a missing design from a zero-strength hull.
-pub unsafe fn lookup_design_strength_checked(name_cstr: *const c_char) -> Option<f32> {
-    let creature = lookup_design_creature(name_cstr)?;
-    read_checked::<f32>(creature + CREATURE_COMBAT_VALUE_OFFSET)
+    let Some(creature) = lookup_design_creature(name_cstr) else {
+        return 0.0;
+    };
+    read_checked::<f32>(creature + CREATURE_COMBAT_VALUE_OFFSET).unwrap_or(0.0)
 }
 
 /// Reads fuel/speed stats for `spawnTradeConvoy?` from a `LIB_SHIPS` design.

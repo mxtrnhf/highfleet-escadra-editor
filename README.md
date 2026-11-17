@@ -62,12 +62,12 @@ To avoid copying long ship lists across multiple pools:
 
 | Pool | What it controls | Optional sub-fields |
 |---|---|---|
-| `strikegroups` | Roaming & endgame Strike Groups | `flagships_normal`, `flagships_hard`, `fill_normal`, `fill_hard`, `missile_escorts`, `carrier_escorts`, `khiva_extra`, `endgame_rider`, `count`, `ship_count`, `sprinkle` |
+| `strikegroups` | Roaming & endgame Strike Groups | `flagships_normal`, `flagships_hard`, `fill_normal`, `fill_hard`, `missile_escorts`, `carrier_escorts`, `khiva_extra`, `endgame_rider`, `count`, `budget`, `sprinkle` |
 | `tactical_air` | City aircraft tactical groups & SG carrier escorts | `count`, `ship_count` |
 | `tactical_missile` | City missile tactical groups & SG missile riders | `ships`, `escorts`, `sg_missile`, `endgame_rider`, `count`, `ship_count` |
-| `garrisons` | City garrisons (campaign & Nuclear War) | `campaign`, `endgame`, `ship_count`, `include_in_shipworks` *(bool, mirrors roster edits into `shipworks`)* |
+| `garrisons` | City garrisons (campaign & Nuclear War) | `campaign`, `endgame`, `budget`, `include_in_shipworks` *(bool, mirrors roster edits into `shipworks`)* |
 | `tarkhans` | Named Tarkhan personal ships & Khiva finale flagships | `campaign`, `tier0`, `tier1`, `tier2`, `tier3`, `tier4` |
-| `mercs` | Mercenary `FOR_HIRE`, Nuclear War `FOR_JOIN`, `ASK_REINFORCE` | `hire`, `ship_count` (paid stock only), `endgame`, `reinforcements`, `reinforcements_tier0` |
+| `mercs` | Mercenary `FOR_HIRE`, Nuclear War `FOR_JOIN`, `ASK_REINFORCE` | `hire`, `budget` (paid stock only), `endgame`, `reinforcements`, `reinforcements_tier0` |
 | `traders` | Trade Convoys *(flat `add`/`remove` edits escorts safely)* | `ships` *(prize hulls, auto-marked capturable `m_prize = 1`)*, `escorts`, `escorts_hard`, `count` |
 | `shipworks` | Shipworks `TEST` combat opponents *(flat `add` auto-classifies by stats)* | `small`, `mid`, `large`, `carrier` |
 
@@ -101,26 +101,48 @@ All changes affect **new campaigns and future spawns**—ships already saved in 
 
 ---
 
-## Ships per group (`ship_count`)
+## Tactical package size (`ship_count`)
 
-Set `"ship_count": [min, max]` to roll a ship total per newly generated group, including both endpoints. For a fixed size use equal bounds, e.g. `[4, 4]`. Both values must be positive 32-bit JSON integers and `min` must not exceed `max`. Omit the field to keep the normal spawn math. Malformed ranges are logged and ignored without discarding other settings.
+`tactical_air` and `tactical_missile` accept `"ship_count": [min, max]`. The roll includes both endpoints; equal bounds such as `[4, 4]` give a fixed size. Both values must be positive 32-bit JSON integers, with `min` no greater than `max`. Malformed ranges are logged and ignored.
 
 ```json
 {
-  "strikegroups": { "ship_count": [2, 8] },
   "tactical_air": { "ship_count": [1, 2] },
-  "tactical_missile": { "ship_count": [2, 4] },
-  "garrisons": { "ship_count": [4, 4] },
-  "mercs": { "hire": { "ship_count": [2, 6] } }
+  "tactical_missile": { "ship_count": [2, 4] }
 }
 ```
 
-* **Strike Groups:** counts the whole generated fleet, including any carrier, missile escort, Khiva hull or outer Nuclear War rider that fits. A one-ship Khiva group keeps the Khiva hull if available.
-* **Tactical air and missile:** counts the initial city package only, not the garrison or SG escorts. `count` still controls the chance of spawning a package. A missile package reserves a slot for an escort if it has at least two slots and both pools have available designs. Vanilla behavior still decides which ships detach later.
-* **Garrisons:** counts the base garrison before any tactical packages are added. Applies to new garrisons generated in either phase.
-* **Mercenaries:** counts paid `FOR_HIRE` offers per mercenary city, not free `FOR_JOIN` offers or reinforcements. This can exceed the vanilla five-offer cap. `mercs.ship_count` is shorthand; a valid `mercs.hire.ship_count` takes precedence (`for_hire` is an alias for `hire`).
+This controls the initial city package only, not the base garrison, Strike Group escorts, or which ships detach later. `count` still controls whether the package rolls at all. Designs can repeat. A missile package of at least two ships reserves one escort slot when both the missile and escort pools have usable designs.
 
-The budget still guides the initial draft; the size takes precedence if more ships are needed to reach the rolled target. Designs can repeat. If no usable designs remain, a sized Strike Group falls back to Borey to avoid creating an empty fleet; the other pools stay empty. Large values can make generation and gameplay very slow.
+### Vanilla group sizes
+
+These are totals for one generated group or one mercenary city's stock, not the number of groups on the map. Tactical numbers apply only if a package actually spawns.
+
+| Group | Vanilla size |
+|---|---|
+| Strike Groups | **No fixed ship-count cap.** One flagship, plus as many fill ships as the budget roll allows. Up to one carrier and one missile escort can be added. Khiva adds a Typhon; an outer Nuclear War group gets one late missile rider. |
+| Air tactical package | **1** Longbow. |
+| Missile tactical package | **2–4** ships: a Tarantul and a Hound, with independent 50% rolls for an Eagle and a Tarantul MRL. |
+| City garrison | **No fixed ship-count cap.** The city budget determines the base roster. The draft prefers at least three ships, but can return two, one, or none. Tactical packages add ships on top. |
+| Paid mercenary stock (`FOR_HIRE`) | **0–5** offers per mercenary city. The budget determines the draft; the game keeps at most five offers. |
+
+### Combat-value targets (`budget`)
+
+`strikegroups`, `garrisons` and paid mercenary stock use `"budget": N` instead of `ship_count`. `N` is a JSON number from 0 to 10,000 in **combat value**, not credits or ships. It replaces the game's target for the draft: the game tries to reach that target and normally allows a draw to bring the draft up to about 20% over it. A higher budget can buy more ships, stronger ships, or both; it does not guarantee a ship count. Omit `budget` for the original target. Invalid values are logged and ignored.
+
+```json
+{
+  "strikegroups": { "budget": 250 },
+  "garrisons": { "budget": 80 },
+  "mercs": { "hire": { "budget": 100 } }
+}
+```
+
+* **Strike Groups:** the same target replaces the budget in all three waves. The vanilla targets are **150–350** for campaign roaming groups, **100** for Khiva, and **200 normal / 300 hard** for outer Nuclear War groups. The flagship is chosen even if its cost is above the target, and escorts, the Khiva hull and the late rider aren't charged against the fill budget. `budget: 0` stops the fill draft but doesn't disable the fleet; use `count: "0"` to disable the waves.
+* **Garrisons:** replaces the city-dependent budget for the base garrison only. `budget: 0` stops the base draft but doesn't change the tactical package chances.
+* **Paid mercenaries:** replaces the city-dependent budget without changing the **five-offer cap**, free `FOR_JOIN` stock, or reinforcements. `budget: 0` produces no paid offers. `mercs.budget` is shorthand; a valid `mercs.hire.budget` takes precedence (`for_hire` is an alias for `hire`).
+
+If upgrading from v0.7.0, replace `ship_count` in these three budget-driven sections; the old ship-count keys are ignored there. Large budgets can slow down generation and gameplay. See the [Steam 1.163 spawn-pool audit](https://github.com/mxtrnhf/hf_notes/blob/master/docs/findings/strategy/enemy-ship-pools.md) for the native draft and spawn rules.
 
 ---
 
@@ -287,7 +309,7 @@ A full `"this game is mine and I will play with MY ships"` overhaul using
 ## Build & install
 
 * Build: `cargo xwin build --release --target x86_64-pc-windows-msvc`
-* Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`). Latest: `hf_hee_v0.7.0.dll`.
+* Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`). Latest: `hf_hee_v0.8.0.dll`.
 * Release packs: include `README.md` alongside the DLL so users have the `escadra.json` reference.
 * Config: `Modloader/config/escadra.json` is auto-created on first run if missing. Existing configs load without changes.
 
@@ -295,6 +317,7 @@ A full `"this game is mine and I will play with MY ships"` overhaul using
 
 ## Changelog
 
+* **v0.8.0**: Replaced `ship_count` with `budget` for Strike Groups, garrisons, and paid mercenary stock. Tactical packages still use `ship_count`. Refactored roster drafting and documented vanilla sizes.
 * **v0.7.0**: Added optional `ship_count` ranges and fixed sizes for Strike Groups, air and missile tactical packages, city garrisons, and paid mercenary stock.
 * **v0.6.0**:
   * Custom `.seria` ships now load directly from `"ship_dirs"` (default `["Modloader/ships", "Ships"]`) into a private HEE cache without touching `LIB_SHIPS` (`0x143a13a70`), so Shipworks never hides or locks custom designs and edits reload automatically on `mtime` change.

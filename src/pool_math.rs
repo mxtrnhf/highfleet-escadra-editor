@@ -8,7 +8,8 @@ use std::ffi::CString;
 use std::path::Path;
 
 use crate::config::{
-    parse_count_field, parse_ship_count, Config, CountOp, PoolConfig, ShipCount, ShipworksConfig,
+    parse_budget, parse_count_field, parse_ship_count, Config, CountOp, PoolConfig, ShipCount,
+    ShipworksConfig,
 };
 use crate::native::DesignConvoyStats;
 use crate::pools;
@@ -342,9 +343,9 @@ pub struct ResolvedPools {
     /// chances (`chanceA` / `chanceB`, pool `0` garrisons only).
     pub tactical_air_count_op: Option<CountOp>,
     pub tactical_missile_count_op: Option<CountOp>,
-    pub sg_ship_count: Option<ShipCount>,
-    pub garrison_ship_count: Option<ShipCount>,
-    pub hire_ship_count: Option<ShipCount>,
+    pub sg_budget: Option<f32>,
+    pub garrison_budget: Option<f32>,
+    pub hire_budget: Option<f32>,
     pub tactical_air_ship_count: Option<ShipCount>,
     pub tactical_missile_ship_count: Option<ShipCount>,
 
@@ -501,17 +502,15 @@ impl ResolvedPools {
         let empty = PoolConfig::default();
         let sg = &config.strikegroups;
         let tm = &config.tactical_missile;
-        let sg_ship_count = parse_ship_count("strikegroups", sg.ship_count.as_ref());
-        let garrison_ship_count =
-            parse_ship_count("garrisons", config.garrisons.ship_count.as_ref());
+        let sg_budget = parse_budget("strikegroups", sg.budget.as_ref());
+        let garrison_budget = parse_budget("garrisons", config.garrisons.budget.as_ref());
         let tactical_air_ship_count =
             parse_ship_count("tactical_air", config.tactical_air.ship_count.as_ref());
         let tactical_missile_ship_count =
             parse_ship_count("tactical_missile", tm.ship_count.as_ref());
         let hire = config.mercs.hire.as_ref();
-        let hire_ship_count =
-            parse_ship_count("mercs.hire", hire.and_then(|hire| hire.ship_count.as_ref()))
-                .or_else(|| parse_ship_count("mercs", config.mercs.ship_count.as_ref()));
+        let hire_budget = parse_budget("mercs.hire", hire.and_then(|hire| hire.budget.as_ref()))
+            .or_else(|| parse_budget("mercs", config.mercs.budget.as_ref()));
 
         // Strike Group carrier escorts: explicit `strikegroups.carrier_escorts` wins,
         // else syncs with `tactical_air` when edited.
@@ -557,9 +556,9 @@ impl ResolvedPools {
         // Mercs: `hire` (pool 2), `endgame` (pool 4 — also falls back to `garrisons.endgame` if
         // the user put late-game Khiva-defense city ships under `garrisons.endgame` without setting `mercs.endgame`!),
         // and `reinforcements` (`ASK_REINFORCE` tier 1).
-        // A nested size-only hire override should still inherit the flat roster.
+        // A nested budget-only hire override should still inherit the flat roster.
         let mercs_hire_cfg = hire
-            .filter(|hire| hire.ship_count.is_none() || !hire.pool.is_empty())
+            .filter(|hire| hire.budget.is_none() || !hire.pool.is_empty())
             .map_or(&config.mercs.base, |hire| &hire.pool);
         let mercs_endgame_cfg = config
             .mercs
@@ -820,9 +819,9 @@ impl ResolvedPools {
             sg_sprinkle: sg.sprinkle,
             tactical_air_count_op,
             tactical_missile_count_op,
-            sg_ship_count,
-            garrison_ship_count,
-            hire_ship_count,
+            sg_budget,
+            garrison_budget,
+            hire_budget,
             tactical_air_ship_count,
             tactical_missile_ship_count,
 
@@ -850,8 +849,8 @@ impl ResolvedPools {
     /// True when at least one pool in `escadra.json` differs from vanilla.
     pub fn has_any_edits(&self) -> bool {
         self.has_any_ship_edits()
-            || self.sg_ship_count.is_some()
-            || self.has_spawn_ship_count()
+            || self.sg_budget.is_some()
+            || self.needs_spawn_hook()
             || self.traders_count.is_some()
             || self.sg_wave_counts.is_some()
             || self.sg_sprinkle
@@ -859,164 +858,169 @@ impl ResolvedPools {
             || self.tactical_missile_count_op.is_some()
     }
 
-    pub fn has_spawn_ship_count(&self) -> bool {
-        self.garrison_ship_count.is_some()
-            || self.hire_ship_count.is_some()
-            || self.tactical_air_ship_count.is_some()
-            || self.tactical_missile_ship_count.is_some()
+    pub fn needs_spawn_hook(&self) -> bool {
+        self.spawn_ships_edited
+            || self.garrison_budget.is_some()
+            || self.hire_budget.is_some()
+            || self.tactical_ship_count_enabled()
+    }
+
+    pub fn tactical_ship_count_enabled(&self) -> bool {
+        self.tactical_air_ship_count.is_some() || self.tactical_missile_ship_count.is_some()
     }
 }
 
-/// Exact replica of `somethingSpawnShips`'s (`0x1402056f1`..`0x1402058f9`) and
-/// `Fleet_SelectShipsForBudget`'s (`0x140206060`..`0x1402068f0`) 10-attempt budget roller.
+#[derive(Default)]
+struct BudgetDraft {
+    ships: Vec<usize>,
+    total: f32,
+}
+
+fn roll_budget_attempt(
+    prices: &[f32],
+    budget: f32,
+    max_allowed: f32,
+    rand_index: &mut impl FnMut(usize) -> Option<usize>,
+) -> BudgetDraft {
+    let mut draft = BudgetDraft::default();
+    let mut rejects_left = 10;
+    while draft.total < budget && rejects_left > 0 {
+        let Some((index, price)) = draw_price(prices, rand_index) else {
+            break;
+        };
+        let next_total = draft.total + price;
+        if next_total > max_allowed || next_total <= draft.total || !next_total.is_finite() {
+            rejects_left -= 1;
+            continue;
+        }
+        draft.total = next_total;
+        draft.ships.push(index);
+        rejects_left = 10;
+    }
+    draft
+}
+
+fn draw_price(
+    prices: &[f32],
+    rand_index: &mut impl FnMut(usize) -> Option<usize>,
+) -> Option<(usize, f32)> {
+    let index = rand_index(prices.len())?;
+    Some((index, *prices.get(index)?))
+}
+
+/// Runs the native ten-attempt draft. An unavailable
+/// or out-of-range draw ends the current attempt rather than indexing the pool.
+/// See [the spawn roll audit](https://github.com/mxtrnhf/hf_notes/blob/master/docs/findings/strategy/enemy-ship-pools.md#12-roll-loop-0x1402056f10x1402058f7).
 pub fn roll_spawn_ships_indices<R>(
     prices: &[f32],
     budget: f32,
     any_size: bool,
     fallback_random_if_empty: bool,
-    limit: usize,
     mut rand_index: R,
 ) -> Vec<usize>
 where
-    R: FnMut(usize) -> usize,
+    R: FnMut(usize) -> Option<usize>,
 {
     if prices.is_empty() {
         return Vec::new();
     }
-    if budget <= 0.0 {
-        if fallback_random_if_empty {
-            return vec![rand_index(prices.len())];
+    let mut chosen = if budget <= 0.0 {
+        Vec::new()
+    } else {
+        best_budget_draft(prices, budget, any_size, &mut rand_index)
+    };
+    if chosen.is_empty() && fallback_random_if_empty {
+        if let Some((index, _)) = draw_price(prices, &mut rand_index) {
+            chosen.push(index);
         }
-        return Vec::new();
     }
+    chosen
+}
 
+fn best_budget_draft(
+    prices: &[f32],
+    budget: f32,
+    any_size: bool,
+    rand_index: &mut impl FnMut(usize) -> Option<usize>,
+) -> Vec<usize> {
     let slack = budget * 0.2;
     let max_allowed = budget + slack;
-
-    let mut best_any: Vec<usize> = Vec::new();
-    let mut best_any_total: f32 = 0.0;
-    let mut best_ge2: Vec<usize> = Vec::new();
-    let mut best_ge2_total: f32 = 0.0;
-    let mut best_ge3: Vec<usize> = Vec::new();
-    let mut best_ge3_total: f32 = 0.0;
+    let mut best_any = BudgetDraft::default();
+    let mut best_pair_or_larger = BudgetDraft::default();
+    let mut best_trio_or_larger = BudgetDraft::default();
 
     for _attempt in 0..10 {
-        let mut candidate: Vec<usize> = Vec::new();
-        let mut rejects_left: u32 = 10;
-        let mut total: f32 = 0.0;
-
-        while candidate.len() < limit && total < budget && rejects_left > 0 {
-            let idx = rand_index(prices.len());
-            let next_total = total + prices[idx];
-            if next_total > max_allowed {
-                rejects_left -= 1;
-            } else {
-                total = next_total;
-                candidate.push(idx);
-                rejects_left = 10;
-            }
+        let candidate = roll_budget_attempt(prices, budget, max_allowed, rand_index);
+        let ship_count = candidate.ships.len();
+        if candidate.total > best_any.total {
+            best_any.ships.clone_from(&candidate.ships);
+            best_any.total = candidate.total;
         }
-
-        if total > best_any_total {
-            best_any_total = total;
-            best_any.clone_from(&candidate);
+        if ship_count >= 2 && candidate.total > best_pair_or_larger.total {
+            best_pair_or_larger.ships.clone_from(&candidate.ships);
+            best_pair_or_larger.total = candidate.total;
         }
-        if candidate.len() >= 2 && total > best_ge2_total {
-            best_ge2_total = total;
-            best_ge2.clone_from(&candidate);
-        }
-        if candidate.len() >= 3 && total > best_ge3_total {
-            best_ge3_total = total;
-            best_ge3.clone_from(&candidate);
-
-            let delta = total - budget;
+        if ship_count >= 3 && candidate.total > best_trio_or_larger.total {
+            let delta = candidate.total - budget;
+            best_trio_or_larger = candidate;
             if delta > -0.5 * slack && delta < slack {
                 break;
             }
         }
     }
 
-    let chosen = if any_size {
-        best_any
-    } else if !best_ge3.is_empty() {
-        best_ge3
-    } else if !best_ge2.is_empty() {
-        best_ge2
-    } else {
-        best_any
-    };
-
-    if chosen.is_empty() && fallback_random_if_empty {
-        vec![rand_index(prices.len())]
-    } else {
-        chosen
+    if !any_size && !best_trio_or_larger.ships.is_empty() {
+        return best_trio_or_larger.ships;
     }
+    if !any_size && !best_pair_or_larger.ships.is_empty() {
+        return best_pair_or_larger.ships;
+    }
+    best_any.ships
 }
 
-/// Exact replica of `Endgame_BuildEscadra`'s flagship + fill budget roller
+/// Drafts the flagship and fill from `Endgame_BuildEscadra`'s budget rules
 /// (`0x1402080ba`..`0x140208243`), returning `(Option<flagship_idx>, Vec<fill_idx>)`.
 pub fn roll_strikegroup_indices<R>(
     flagship_prices: &[f32],
     fill_prices: &[f32],
     budget: f32,
-    limit: usize,
     mut rand_index: R,
 ) -> (Option<usize>, Vec<usize>)
 where
-    R: FnMut(usize) -> usize,
+    R: FnMut(usize) -> Option<usize>,
 {
-    let mut total: f32 = 0.0;
-    let mut chosen_flagship: Option<usize> = None;
+    let half_budget = budget * 0.5;
+    let flagship = flagship_prices
+        .iter()
+        .position(|&price| price <= half_budget)
+        .or_else(|| flagship_prices.len().checked_sub(1));
+    let mut total = flagship
+        .and_then(|idx| flagship_prices.get(idx))
+        .copied()
+        .unwrap_or(0.0);
 
-    if limit != 0 && !flagship_prices.is_empty() {
-        let half_budget = budget * 0.5;
-        for (idx, &price) in flagship_prices.iter().enumerate() {
-            if price <= half_budget {
-                chosen_flagship = Some(idx);
-                total += price;
-                break;
-            }
-        }
-        if chosen_flagship.is_none() {
-            let last_idx = flagship_prices.len() - 1;
-            chosen_flagship = Some(last_idx);
-            total += flagship_prices[last_idx];
-        }
-    }
-
-    let mut chosen_fill: Vec<usize> = Vec::new();
+    let mut fill = Vec::new();
     if fill_prices.is_empty() {
-        return (chosen_flagship, chosen_fill);
+        return (flagship, fill);
     }
 
     let max_allowed = budget + budget * 0.2;
-    let mut retries_left: u32 = 10;
-    let fill_limit = limit - usize::from(chosen_flagship.is_some());
-
-    while chosen_fill.len() < fill_limit && total < budget && retries_left > 0 {
-        let idx = rand_index(fill_prices.len());
-        let next_total = total + fill_prices[idx];
-        if next_total >= max_allowed {
-            retries_left -= 1;
-        } else {
-            chosen_fill.push(idx);
-            total = next_total;
-            retries_left = 10;
+    let mut rejects_left = 10;
+    while total < budget && rejects_left > 0 {
+        let Some((index, price)) = draw_price(fill_prices, &mut rand_index) else {
+            break;
+        };
+        let next_total = total + price;
+        if next_total >= max_allowed || next_total <= total || !next_total.is_finite() {
+            rejects_left -= 1;
+            continue;
         }
+        fill.push(index);
+        total = next_total;
+        rejects_left = 10;
     }
 
-    (chosen_flagship, chosen_fill)
-}
-
-/// Top up a bounded draft after the usual budget roll, preferring the cheapest hull.
-/// Repeats are allowed, as in the native draft. Empty pools stay empty.
-pub fn top_up_draft(picked: &mut Vec<usize>, prices: &[f32], target: usize) {
-    if picked.len() >= target {
-        return;
-    }
-    if let Some((idx, _)) = prices.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)) {
-        picked.resize(target, idx);
-    }
+    (flagship, fill)
 }
 
 /// Exact replica of `spawnTradeConvoy?`'s convoy fuel-range eligibility check

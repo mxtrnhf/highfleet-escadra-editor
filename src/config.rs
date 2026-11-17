@@ -144,6 +144,26 @@ pub fn parse_ship_count(path: &str, field: Option<&serde_json::Value>) -> Option
     bounds
 }
 
+/// The native draft has no ship-count cap. Bound overrides to avoid extreme
+/// values, where small hull costs can stop advancing the native float sum.
+const MAX_COMBAT_BUDGET: f64 = 10_000.0;
+
+/// Reads a native combat-value target, leaving the original budget on error.
+pub fn parse_budget(path: &str, field: Option<&serde_json::Value>) -> Option<f32> {
+    let field = field?;
+    if let Some(value) = field.as_f64() {
+        if (0.0..=MAX_COMBAT_BUDGET).contains(&value) {
+            let budget = value as f32;
+            log::info!("hf_hee: {path}.budget -> {budget} combat value");
+            return Some(budget);
+        }
+    }
+    log::error!(
+        "hf_hee: bad {path}.budget = {field}; expected a number between 0 and {MAX_COMBAT_BUDGET}"
+    );
+    None
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -297,7 +317,7 @@ pub struct StrikeGroupsConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ship_count: Option<serde_json::Value>,
+    pub budget: Option<serde_json::Value>,
     /// Normal-mode close-to-Ur flagship pool (`[Borey]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flagships_normal: Option<PoolConfig>,
@@ -420,7 +440,7 @@ pub struct GarrisonsConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ship_count: Option<serde_json::Value>,
+    pub budget: Option<serde_json::Value>,
     /// Usual campaign city garrisons (`Profile.endwar == 0`, pool `0`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub campaign: Option<PoolConfig>,
@@ -495,9 +515,9 @@ impl TarkhansConfig {
 pub struct MercsConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
-    /// Shortcut for setting the size of paid FOR_HIRE stock only.
+    /// Shortcut for setting the draft budget for paid FOR_HIRE stock only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ship_count: Option<serde_json::Value>,
+    pub budget: Option<serde_json::Value>,
     /// Paid `FOR_HIRE` pier ships in Mercenary cities (`somethingSpawnShips` pool `2`).
     #[serde(alias = "for_hire", skip_serializing_if = "Option::is_none")]
     pub hire: Option<HireConfig>,
@@ -518,7 +538,7 @@ pub struct HireConfig {
     #[serde(flatten)]
     pub pool: PoolConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ship_count: Option<serde_json::Value>,
+    pub budget: Option<serde_json::Value>,
 }
 
 impl MercsConfig {
