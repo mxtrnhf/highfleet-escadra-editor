@@ -8,8 +8,8 @@ use std::ffi::CString;
 use std::path::Path;
 
 use crate::config::{
-    parse_budget, parse_count_field, parse_ship_count, Config, CountOp, PoolConfig, ShipCount,
-    ShipworksConfig,
+    parse_budget, parse_city_budget_multiplier, parse_count_field, parse_ship_count, Config,
+    CountOp, PoolConfig, ShipCount, ShipworksConfig,
 };
 use crate::native::DesignConvoyStats;
 use crate::pools;
@@ -344,8 +344,8 @@ pub struct ResolvedPools {
     pub tactical_air_count_op: Option<CountOp>,
     pub tactical_missile_count_op: Option<CountOp>,
     pub sg_budget: Option<f32>,
-    pub garrison_budget: Option<f32>,
-    pub hire_budget: Option<f32>,
+    pub garrison_budget_multiplier: Option<f32>,
+    pub hire_budget_multiplier: Option<f32>,
     pub tactical_air_ship_count: Option<ShipCount>,
     pub tactical_missile_ship_count: Option<ShipCount>,
 
@@ -503,14 +503,24 @@ impl ResolvedPools {
         let sg = &config.strikegroups;
         let tm = &config.tactical_missile;
         let sg_budget = parse_budget("strikegroups", sg.budget.as_ref());
-        let garrison_budget = parse_budget("garrisons", config.garrisons.budget.as_ref());
+        let garrison_budget_multiplier = parse_city_budget_multiplier(
+            "garrisons",
+            config.garrisons.city_budget_multiplier.as_ref(),
+        )
+        .filter(|&multiplier| multiplier != 1.0);
         let tactical_air_ship_count =
             parse_ship_count("tactical_air", config.tactical_air.ship_count.as_ref());
         let tactical_missile_ship_count =
             parse_ship_count("tactical_missile", tm.ship_count.as_ref());
         let hire = config.mercs.hire.as_ref();
-        let hire_budget = parse_budget("mercs.hire", hire.and_then(|hire| hire.budget.as_ref()))
-            .or_else(|| parse_budget("mercs", config.mercs.budget.as_ref()));
+        let hire_budget_multiplier = parse_city_budget_multiplier(
+            "mercs.hire",
+            hire.and_then(|hire| hire.city_budget_multiplier.as_ref()),
+        )
+        .or_else(|| {
+            parse_city_budget_multiplier("mercs", config.mercs.city_budget_multiplier.as_ref())
+        })
+        .filter(|&multiplier| multiplier != 1.0);
 
         // Strike Group carrier escorts: explicit `strikegroups.carrier_escorts` wins,
         // else syncs with `tactical_air` when edited.
@@ -558,7 +568,7 @@ impl ResolvedPools {
         // and `reinforcements` (`ASK_REINFORCE` tier 1).
         // A nested budget-only hire override should still inherit the flat roster.
         let mercs_hire_cfg = hire
-            .filter(|hire| hire.budget.is_none() || !hire.pool.is_empty())
+            .filter(|hire| hire.city_budget_multiplier.is_none() || !hire.pool.is_empty())
             .map_or(&config.mercs.base, |hire| &hire.pool);
         let mercs_endgame_cfg = config
             .mercs
@@ -820,8 +830,8 @@ impl ResolvedPools {
             tactical_air_count_op,
             tactical_missile_count_op,
             sg_budget,
-            garrison_budget,
-            hire_budget,
+            garrison_budget_multiplier,
+            hire_budget_multiplier,
             tactical_air_ship_count,
             tactical_missile_ship_count,
 
@@ -860,8 +870,8 @@ impl ResolvedPools {
 
     pub fn needs_spawn_hook(&self) -> bool {
         self.spawn_ships_edited
-            || self.garrison_budget.is_some()
-            || self.hire_budget.is_some()
+            || self.garrison_budget_multiplier.is_some()
+            || self.hire_budget_multiplier.is_some()
             || self.tactical_ship_count_enabled()
     }
 

@@ -56,7 +56,7 @@ use std::sync::OnceLock;
 
 use patchy::{Condition, PatchSession, ProcessModule, ReturnType, Trampoline};
 
-use crate::config::ShipCount;
+use crate::config::{ShipCount, MAX_COMBAT_BUDGET};
 use crate::native::{
     assign_existing_escadra_string, clear_game_string_vec, create_escadra_from_ships,
     destroy_game_string_vec, get_profile, hge_rand_float, hge_rand_int, init_custom_ship_dirs,
@@ -600,21 +600,7 @@ unsafe fn install_city_spawn_hook(
         "somethingSpawnShips",
     )?;
     let mut tramp = Trampoline::new();
-    for (pool_id, budget) in [
-        (GARRISON_POOL_ID, pools.garrison_budget),
-        (MERC_CITIES_CAMPAIGN_POOL_ID, pools.hire_budget),
-    ] {
-        let Some(budget) = budget else {
-            continue;
-        };
-        let next_pool = tramp.new_label();
-        tramp.bytes(&[0x41, 0x83, 0xf8, pool_id as u8]); // CMP R8D, pool_id
-        tramp.jump_if(Condition::NotEqual, next_pool);
-        tramp.bytes(&[0xb8]); // MOV EAX, budget bits
-        tramp.bytes(&budget.to_bits().to_le_bytes());
-        tramp.bytes(&[0x66, 0x0f, 0x6e, 0xc8]); // MOVD XMM1, EAX
-        tramp.bind(next_pool).map_err(|e| e.to_string())?;
-    }
+    emit_city_budget_scaling(&mut tramp, pools)?;
 
     let rust_spawn = detour_spawn_ships as *const () as usize;
     if pools.spawn_ships_edited {
@@ -637,6 +623,35 @@ unsafe fn install_city_spawn_hook(
     session
         .detour_trampoline(addr, SPAWN_SHIPS_STOLEN, tramp)
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Scales the incoming XMM1 budget only for garrisons and paid offers. EAX and
+/// XMM4 are volatile scratch registers, not arguments to `somethingSpawnShips`.
+fn emit_city_budget_scaling(tramp: &mut Trampoline, pools: &ResolvedPools) -> Result<(), String> {
+    for (pool_id, multiplier) in [
+        (GARRISON_POOL_ID, pools.garrison_budget_multiplier),
+        (MERC_CITIES_CAMPAIGN_POOL_ID, pools.hire_budget_multiplier),
+    ] {
+        let Some(multiplier) = multiplier else {
+            continue;
+        };
+        let next_pool = tramp.new_label();
+        tramp.bytes(&[0x41, 0x83, 0xf8, pool_id as u8]); // CMP R8D, pool_id
+        tramp.jump_if(Condition::NotEqual, next_pool);
+        tramp.bytes(&[0xb8]); // MOV EAX, multiplier bits
+        tramp.bytes(&multiplier.to_bits().to_le_bytes());
+        tramp.bytes(&[0x66, 0x0f, 0x6e, 0xe0]); // MOVD XMM4, EAX
+        tramp.bytes(&[0xf3, 0x0f, 0x59, 0xcc]); // MULSS XMM1, XMM4
+
+        // The native budget draft has no ship-count limit. Cap the product,
+        // including positive overflow, before passing it to either draft path.
+        tramp.bytes(&[0xb8]); // MOV EAX, cap bits
+        tramp.bytes(&MAX_COMBAT_BUDGET.to_bits().to_le_bytes());
+        tramp.bytes(&[0x66, 0x0f, 0x6e, 0xe0]); // MOVD XMM4, EAX
+        tramp.bytes(&[0xf3, 0x0f, 0x5d, 0xcc]); // MINSS XMM1, XMM4
+        tramp.bind(next_pool).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

@@ -65,9 +65,9 @@ To avoid copying long ship lists across multiple pools:
 | `strikegroups` | Roaming & endgame Strike Groups | `flagships_normal`, `flagships_hard`, `fill_normal`, `fill_hard`, `missile_escorts`, `carrier_escorts`, `khiva_extra`, `endgame_rider`, `count`, `budget`, `sprinkle` |
 | `tactical_air` | City aircraft tactical groups & SG carrier escorts | `count`, `ship_count` |
 | `tactical_missile` | City missile tactical groups & SG missile riders | `ships`, `escorts`, `sg_missile`, `endgame_rider`, `count`, `ship_count` |
-| `garrisons` | City garrisons (campaign & Nuclear War) | `campaign`, `endgame`, `budget`, `include_in_shipworks` *(bool, mirrors roster edits into `shipworks`)* |
+| `garrisons` | City garrisons (campaign & Nuclear War) | `campaign`, `endgame`, `city_budget_multiplier`, `include_in_shipworks` *(bool, mirrors roster edits into `shipworks`)* |
 | `tarkhans` | Named Tarkhan personal ships & Khiva finale flagships | `campaign`, `tier0`, `tier1`, `tier2`, `tier3`, `tier4` |
-| `mercs` | Mercenary `FOR_HIRE`, Nuclear War `FOR_JOIN`, `ASK_REINFORCE` | `hire`, `budget` (paid stock only), `endgame`, `reinforcements`, `reinforcements_tier0` |
+| `mercs` | Mercenary `FOR_HIRE`, Nuclear War `FOR_JOIN`, `ASK_REINFORCE` | `hire`, `city_budget_multiplier` (paid stock only), `endgame`, `reinforcements`, `reinforcements_tier0` |
 | `traders` | Trade Convoys *(flat `add`/`remove` edits escorts safely)* | `ships` *(prize hulls, auto-marked capturable `m_prize = 1`)*, `escorts`, `escorts_hard`, `count` |
 | `shipworks` | Shipworks `TEST` combat opponents *(flat `add` auto-classifies by stats)* | `small`, `mid`, `large`, `carrier` |
 
@@ -128,21 +128,25 @@ These are totals for one generated group or one mercenary city's stock, not the 
 
 ### Combat-value targets (`budget`)
 
-`strikegroups`, `garrisons` and paid mercenary stock use `"budget": N` instead of `ship_count`. `N` is a JSON number from 0 to 10,000 in **combat value**, not credits or ships. It replaces the game's target for the draft: the game tries to reach that target and normally allows a draw to bring the draft up to about 20% over it. A higher budget can buy more ships, stronger ships, or both; it does not guarantee a ship count. Omit `budget` for the original target. Invalid values are logged and ignored.
+`strikegroups` accepts `"budget": N` to replace its roster draft target in all three waves. `N` is a JSON number from 0 to 10,000 in **combat value**, not credits or ships. The draft can finish about 20% over its target. A higher budget can yield more ships, stronger ships, or both; it doesn't guarantee a ship count. Omit `budget` to keep the vanilla targets: **150–350** for campaign roaming groups, **100** for Khiva, and **200 normal / 300 hard** for outer Nuclear War groups.
+
+The flagship is chosen even if its cost is above the target. Escorts, the Khiva hull, and the late missile rider aren't charged against the draft budget. `budget: 0` stops the fill draft but doesn't disable the fleet; use `count: "0"` to disable the waves.
+
+### City budget scaling (`city_budget_multiplier`)
+
+Use a nonnegative JSON number to multiply each city's own vanilla draft budget. This preserves differences in city size and the stronger budgets toward Khiva instead of setting all cities to the same target. Omit the multiplier or set it to `1` for vanilla. For example, `1.5` gives a city with a vanilla budget of 40 a budget of 60; a city with a budget of 80 gets 120. When scaling is enabled, HEE caps the result at 10,000 combat value before the draft's usual allowance. Invalid values are logged and ignored.
 
 ```json
 {
-  "strikegroups": { "budget": 250 },
-  "garrisons": { "budget": 80 },
-  "mercs": { "hire": { "budget": 100 } }
+  "garrisons": { "city_budget_multiplier": 1.5 },
+  "mercs": { "hire": { "city_budget_multiplier": 1.25 } }
 }
 ```
 
-* **Strike Groups:** the same target replaces the budget in all three waves. The vanilla targets are **150–350** for campaign roaming groups, **100** for Khiva, and **200 normal / 300 hard** for outer Nuclear War groups. The flagship is chosen even if its cost is above the target, and escorts, the Khiva hull and the late rider aren't charged against the fill budget. `budget: 0` stops the fill draft but doesn't disable the fleet; use `count: "0"` to disable the waves.
-* **Garrisons:** replaces the city-dependent budget for the base garrison only. `budget: 0` stops the base draft but doesn't change the tactical package chances.
-* **Paid mercenaries:** replaces the city-dependent budget without changing the **five-offer cap**, free `FOR_JOIN` stock, or reinforcements. `budget: 0` produces no paid offers. `mercs.budget` is shorthand; a valid `mercs.hire.budget` takes precedence (`for_hire` is an alias for `hire`).
+* **Garrisons:** scales only the base roster. A multiplier of `0` stops that draft but leaves the tactical package chances unchanged.
+* **Paid mercenaries (`FOR_HIRE`):** scales only the paid stock, which still has a **five-offer cap** per mercenary city. A multiplier of `0` produces no paid offers. Free `FOR_JOIN` ships and reinforcements are unaffected. `mercs.city_budget_multiplier` is shorthand; a valid `mercs.hire.city_budget_multiplier` takes precedence (`for_hire` is an alias for `hire`).
 
-If upgrading from v0.7.0, replace `ship_count` in these three budget-driven sections; the old ship-count keys are ignored there. Large budgets can slow down generation and gameplay. See the [Steam 1.163 spawn-pool audit](https://github.com/mxtrnhf/hf_notes/blob/master/docs/findings/strategy/enemy-ship-pools.md) for the native draft and spawn rules.
+When upgrading from v0.8.0, replace any flat `budget` under `garrisons` or `mercs`/`mercs.hire`; those keys are now ignored. There is no direct conversion to a multiplier because the vanilla budget varies by city. Large multipliers can slow down generation and gameplay. See the [Steam 1.163 spawn-pool audit](https://github.com/mxtrnhf/hf_notes/blob/master/docs/findings/strategy/enemy-ship-pools.md) for the native draft and spawn rules.
 
 ---
 
@@ -309,7 +313,7 @@ A full `"this game is mine and I will play with MY ships"` overhaul using
 ## Build & install
 
 * Build: `cargo xwin build --release --target x86_64-pc-windows-msvc`
-* Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`). Latest: `hf_hee_v0.8.0.dll`.
+* Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`). Latest: `hf_hee_v0.9.0.dll`.
 * Release packs: include `README.md` alongside the DLL so users have the `escadra.json` reference.
 * Config: `Modloader/config/escadra.json` is auto-created on first run if missing. Existing configs load without changes.
 
@@ -317,6 +321,7 @@ A full `"this game is mine and I will play with MY ships"` overhaul using
 
 ## Changelog
 
+* **v0.9.0**: Replaced flat city budgets with separate `city_budget_multiplier` settings for garrisons and paid `FOR_HIRE` stock, preserving vanilla city progression.
 * **v0.8.0**: Replaced `ship_count` with `budget` for Strike Groups, garrisons, and paid mercenary stock. Tactical packages still use `ship_count`. Refactored roster drafting and documented vanilla sizes.
 * **v0.7.0**: Added optional `ship_count` ranges and fixed sizes for Strike Groups, air and missile tactical packages, city garrisons, and paid mercenary stock.
 * **v0.6.0**:
