@@ -8,8 +8,8 @@ use std::ffi::CString;
 use std::path::Path;
 
 use crate::config::{
-    parse_budget, parse_city_budget_multiplier, parse_count_field, parse_ship_count, Config,
-    CountOp, PoolConfig, ShipCount, ShipworksConfig,
+    parse_budget, parse_city_budget_multiplier, parse_count_field, parse_extra_escort,
+    parse_ship_count, Config, CountOp, PoolConfig, ShipCount, ShipworksConfig,
 };
 use crate::native::DesignConvoyStats;
 use crate::pools;
@@ -284,6 +284,13 @@ pub struct SgWaveCounts {
     pub outer: i32,
 }
 
+/// Separate post-draft pool; entries may be drawn more than once.
+pub struct ExtraEscortPool {
+    pub entries: Vec<PoolEntry>,
+    pub count: usize,
+    pub chance: f64,
+}
+
 /// Resolved ship lists for every native hook site, derived from `escadra.json`.
 pub struct ResolvedPools {
     /// Ordered list of custom ship directories (`config.ship_dirs` plus any
@@ -348,6 +355,10 @@ pub struct ResolvedPools {
     pub hire_budget_multiplier: Option<f32>,
     pub tactical_air_ship_count: Option<ShipCount>,
     pub tactical_missile_ship_count: Option<ShipCount>,
+    pub tactical_air_extra: Option<ExtraEscortPool>,
+    pub tactical_missile_extra: Option<ExtraEscortPool>,
+    pub strikegroup_extra: Option<ExtraEscortPool>,
+    pub hire_extra: Option<ExtraEscortPool>,
 
     pub shipworks_edited: bool,
     pub shipworks_small: Vec<PoolEntry>,
@@ -399,6 +410,37 @@ fn resolve_pool_with_ctx(
     }
 
     items
+}
+
+/// Uses the same name, group, and wildcard expansion as ordinary additions.
+fn resolve_extra_escort(
+    path: &str,
+    field: Option<&serde_json::Value>,
+    ctx: &mut DesignExpansionContext<'_>,
+) -> Option<ExtraEscortPool> {
+    let config = parse_extra_escort(path, field)?;
+    if config.count == 0 || config.chance == 0.0 {
+        return None;
+    }
+    let entries: Vec<_> = ctx
+        .expand_add_list(&config.add)
+        .iter()
+        .filter_map(|name| PoolEntry::new(name))
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    log::info!(
+        "hf_hee: {path}.extra_escort -> {} candidates, {} rolls at chance {}",
+        entries.len(),
+        config.count,
+        config.chance
+    );
+    Some(ExtraEscortPool {
+        entries,
+        count: config.count,
+        chance: config.chance,
+    })
 }
 
 fn select_sub<'a>(sub: &'a Option<PoolConfig>, fallback: &'a PoolConfig) -> &'a PoolConfig {
@@ -782,6 +824,18 @@ impl ResolvedPools {
             &mut ctx,
         );
 
+        let tactical_air_extra = resolve_extra_escort(
+            "tactical_air",
+            config.tactical_air.extra_escort.as_ref(),
+            &mut ctx,
+        );
+        let tactical_missile_extra =
+            resolve_extra_escort("tactical_missile", tm.extra_escort.as_ref(), &mut ctx);
+        let strikegroup_extra =
+            resolve_extra_escort("strikegroups", sg.extra_escort.as_ref(), &mut ctx);
+        let hire_extra =
+            resolve_extra_escort("mercs", config.mercs.extra_escort.as_ref(), &mut ctx);
+
         Self {
             ship_dirs: ctx.ship_dirs,
             sg_edited,
@@ -834,6 +888,10 @@ impl ResolvedPools {
             hire_budget_multiplier,
             tactical_air_ship_count,
             tactical_missile_ship_count,
+            tactical_air_extra,
+            tactical_missile_extra,
+            strikegroup_extra,
+            hire_extra,
 
             shipworks_edited,
             shipworks_small: shipworks.small,
@@ -854,6 +912,10 @@ impl ResolvedPools {
             || self.reinforcements_edited
             || self.traders_edited
             || self.shipworks_edited
+            || self.tactical_air_extra.is_some()
+            || self.tactical_missile_extra.is_some()
+            || self.strikegroup_extra.is_some()
+            || self.hire_extra.is_some()
     }
 
     /// True when at least one pool in `escadra.json` differs from vanilla.

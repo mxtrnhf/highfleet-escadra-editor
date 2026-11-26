@@ -144,6 +144,37 @@ pub fn parse_ship_count(path: &str, field: Option<&serde_json::Value>) -> Option
     bounds
 }
 
+#[derive(Deserialize)]
+pub struct ExtraEscortConfig {
+    pub add: Vec<String>,
+    pub count: usize,
+    pub chance: f64,
+}
+
+/// Bound extra rolls per spawn independently of the core draft/offer limits.
+const MAX_EXTRA_ESCORT_ROLLS: usize = 32;
+
+/// A malformed extra pool is ignored without dropping the rest of the config.
+pub fn parse_extra_escort(
+    path: &str,
+    field: Option<&serde_json::Value>,
+) -> Option<ExtraEscortConfig> {
+    let field = field?;
+    match ExtraEscortConfig::deserialize(field) {
+        Ok(config)
+            if config.count <= MAX_EXTRA_ESCORT_ROLLS && (0.0..=1.0).contains(&config.chance) =>
+        {
+            Some(config)
+        }
+        _ => {
+            log::error!(
+                "hf_hee: bad {path}.extra_escort; expected add (ship list), count (integer 0..={MAX_EXTRA_ESCORT_ROLLS}), and chance (number 0..=1)"
+            );
+            None
+        }
+    }
+}
+
 /// The native draft has no ship-count cap. Bound overrides to avoid extreme
 /// values, where small hull costs can stop advancing the native float sum.
 pub const MAX_COMBAT_BUDGET: f32 = 10_000.0;
@@ -277,6 +308,8 @@ pub struct TacticalAirConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_escort: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ship_count: Option<serde_json::Value>,
     /// Optional group-count adjustment for Air Tactical Groups. Applies to the
     /// per-city `chanceA` spawn probability (vanilla `0.15` normal / `0.20` hard,
@@ -330,6 +363,8 @@ fn summarize_with_subs(base: &PoolConfig, subs: &[(&str, &Option<PoolConfig>)]) 
 pub struct StrikeGroupsConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_escort: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<serde_json::Value>,
     /// Normal-mode close-to-Ur flagship pool (`[Borey]`).
@@ -406,6 +441,8 @@ impl StrikeGroupsConfig {
 pub struct TacticalMissileConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_escort: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ship_count: Option<serde_json::Value>,
     /// City Missile Tactical Group cruisers (`[Tarantul, Eagle, Tarantul MRL]`).
@@ -529,6 +566,9 @@ impl TarkhansConfig {
 pub struct MercsConfig {
     #[serde(flatten)]
     pub base: PoolConfig,
+    /// Extra paid pier offers, independent of the normal city budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_escort: Option<serde_json::Value>,
     /// Shortcut for scaling city budgets for paid FOR_HIRE stock only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub city_budget_multiplier: Option<serde_json::Value>,

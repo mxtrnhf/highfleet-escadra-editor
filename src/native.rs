@@ -282,6 +282,37 @@ pub unsafe fn clear_game_string_vec(vec: *mut RawStringVec) {
     clear_fn(vec);
 }
 
+/// Counts the initialized elements of a borrowed native string vector.
+///
+/// # Safety
+/// `vec` must be a non-null, aligned, initialized header valid on the game
+/// thread; it and its backing storage must not change during this call.
+pub unsafe fn game_string_vec_len(vec: *const RawStringVec) -> usize {
+    (*vec).end.saturating_sub((*vec).begin) / size_of::<RawEscadraString>()
+}
+
+/// Discards only the tail, leaving the surviving native strings in place.
+///
+/// # Safety
+/// `vec` must be a non-null, aligned, initialized native vector with live,
+/// properly aligned elements. The game-thread caller exclusively lends it for
+/// this operation and remains responsible for destroying the remaining buffer.
+pub unsafe fn truncate_game_string_vec(vec: *mut RawStringVec, keep: usize) {
+    let len = game_string_vec_len(vec);
+    if keep >= len {
+        return;
+    }
+    let stride = size_of::<RawEscadraString>();
+    let new_end = (*vec).begin + keep * stride;
+    // SAFETY: The native tidy routine destroys each initialized trailing string
+    // with the correct CRT, just as the native clear routine does for the full range.
+    let tidy: StringTidyFn = std::mem::transmute(FN_STRING_TIDY);
+    while (*vec).end > new_end {
+        (*vec).end -= stride;
+        tidy((*vec).end as *mut RawEscadraString);
+    }
+}
+
 /// Destroys and frees a game-owned `CVec<EscadraString>`.
 pub unsafe fn destroy_game_string_vec(vec: *mut RawStringVec) {
     if vec.is_null() {

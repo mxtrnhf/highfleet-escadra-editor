@@ -59,16 +59,17 @@ use patchy::{Condition, PatchSession, ProcessModule, ReturnType, Trampoline};
 use crate::config::{ShipCount, MAX_COMBAT_BUDGET};
 use crate::native::{
     assign_existing_escadra_string, clear_game_string_vec, create_escadra_from_ships,
-    destroy_game_string_vec, get_profile, hge_rand_float, hge_rand_int, init_custom_ship_dirs,
-    init_uninitialized_escadra_string_cstr, is_endwar, is_far_from_ur_or_hard, is_hard_mode,
-    lookup_design_convoy_stats, lookup_design_creature, lookup_design_shipworks_stats,
-    lookup_design_strength, mark_first_matching_ship_as_prize, push_game_string, read_checked,
-    resolve_ship_library_for_name, RawEscadraString, RawStringVec, Vec2, LOCATION_FLAG_OFFSET,
-    LOCATION_KIND_STATE_OFFSET, NPC_SHIP_FIRST_OFFSET, PROFILE_LOCATIONS_OFFSET,
+    destroy_game_string_vec, game_string_vec_len, get_profile, hge_rand_float, hge_rand_int,
+    init_custom_ship_dirs, init_uninitialized_escadra_string_cstr, is_endwar,
+    is_far_from_ur_or_hard, is_hard_mode, lookup_design_convoy_stats, lookup_design_creature,
+    lookup_design_shipworks_stats, lookup_design_strength, mark_first_matching_ship_as_prize,
+    push_game_string, read_checked, resolve_ship_library_for_name, truncate_game_string_vec,
+    RawEscadraString, RawStringVec, Vec2, LOCATION_FLAG_OFFSET, LOCATION_KIND_STATE_OFFSET,
+    NPC_SHIP_FIRST_OFFSET, PROFILE_LOCATIONS_OFFSET,
 };
 use crate::pool_math::{
     classify_shipworks_bucket, convoy_can_support_escort, roll_spawn_ships_indices,
-    roll_strikegroup_indices, PoolEntry, ResolvedPools, ShipworksBucket,
+    roll_strikegroup_indices, ExtraEscortPool, PoolEntry, ResolvedPools, ShipworksBucket,
 };
 use crate::pools::{GARRISON_POOL_ID, MERC_CITIES_CAMPAIGN_POOL_ID, MERC_CITIES_ENDGAME_POOL_ID};
 
@@ -95,6 +96,13 @@ const SG_RIDER_GUARD: [u8; 15] = [
 ];
 
 const STRIKEGROUP_ROLE: i32 = 5;
+
+// Native roster splice sites in Steam 1.163; see the pool audit in `pools.rs`.
+const NATIVE_TACTICAL_PACKAGES_RVA: usize = 0x205906;
+const NATIVE_TACTICAL_CLEANUP_RVA: usize = 0x205a4d;
+const NATIVE_STRIKEGROUP_ROSTER_READY_RVA: usize = 0x2085c7;
+const NATIVE_HIRE_ROSTER_READY_RVA: usize = 0x2a8347;
+const NATIVE_HIRE_OFFER_CAP: usize = 5;
 
 const TARKHAN_SWITCH_RVA: usize = 0x28f695;
 const TARKHAN_SWITCH_RESUME_RVA: usize = 0x28f783;
@@ -257,6 +265,8 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
         install_strikegroup_hook(module, &mut session, &pools)?;
         installed_count += 1;
     }
+
+    installed_count += install_extra_escort_hooks(module, &mut session, &pools)?;
 
     if pools.sg_rider_edited {
         let addr = verify_site_bytes(
@@ -585,6 +595,81 @@ pub unsafe fn install(pools: ResolvedPools) -> Result<usize, String> {
 }
 
 /// # Safety
+/// Install only in the verified Steam 1.163 executable. The selected sites
+/// are native game-thread call boundaries with 16-byte-aligned RSP, no live
+/// volatile values, and initialized, exclusively writable roster vectors.
+unsafe fn install_extra_escort_hooks(
+    module: ProcessModule,
+    session: &mut PatchSession,
+    pools: &ResolvedPools,
+) -> Result<usize, String> {
+    let mut installed = 0;
+    if (pools.tactical_air_extra.is_some() || pools.tactical_missile_extra.is_some())
+        && !pools.spawn_ships_edited
+        && !pools.tactical_ship_count_enabled()
+    {
+        // After CVec assignment at 0x205901: R15 is the output, XMM15 is
+        // chanceA, and [RBP+0xd0] is chanceB. Resume at local-vector cleanup.
+        let site = module
+            .resolve_rva(NATIVE_TACTICAL_PACKAGES_RVA)
+            .map_err(|e| e.to_string())?;
+        let resume = module
+            .resolve_rva(NATIVE_TACTICAL_CLEANUP_RVA)
+            .map_err(|e| e.to_string())?;
+        let mut tramp = Trampoline::new();
+        tramp.bytes(&[
+            0x49, 0x8b, 0xcf, // MOV RCX, R15
+            0x41, 0x0f, 0x28, 0xcf, // MOVAPS XMM1, XMM15
+            0xf3, 0x0f, 0x10, 0x95, 0xd0, 0, 0, 0, // MOVSS XMM2, [RBP+0xd0]
+        ]);
+        tramp.absolute_call(detour_native_tactical_packages as *const ());
+        tramp.absolute_jump(resume);
+        session
+            .detour_trampoline(site, 7, tramp)
+            .map_err(|e| e.to_string())?;
+        installed += 1;
+    }
+
+    if pools.strikegroup_extra.is_some() && !pools.sg_edited {
+        // Shared Strike Group builder, after all native extras and before the
+        // fleet constructor's argument setup at 0x2085c7. Its roster is at RSP+0x30.
+        let site = module
+            .resolve_rva(NATIVE_STRIKEGROUP_ROSTER_READY_RVA)
+            .map_err(|e| e.to_string())?;
+        let mut tramp = Trampoline::new();
+        tramp.bytes(&[0x48, 0x8d, 0x4c, 0x24, 0x30]); // LEA RCX, [RSP+0x30]
+        tramp.absolute_call(detour_native_strikegroup_extra as *const ());
+        tramp.bytes(&[
+            0x89, 0x7c, 0x24, 0x28, // MOV [RSP+0x28], EDI
+            0x48, 0x8b, 0x45, 0x88, // MOV RAX, [RBP-0x78]
+        ]);
+        tramp.absolute_jump(site + 8);
+        session
+            .detour_trampoline(site, 8, tramp)
+            .map_err(|e| e.to_string())?;
+        installed += 1;
+    }
+
+    if pools.hire_extra.is_some() {
+        // Immediately after the paid city's draft call. The draft at [RBP-0x80]
+        // can be native or Rust. The cap at [RSP+0x74] is a local countdown.
+        let site = module
+            .resolve_rva(NATIVE_HIRE_ROSTER_READY_RVA)
+            .map_err(|e| e.to_string())?;
+        let mut tramp = Trampoline::new();
+        tramp.bytes(&[0x48, 0x8d, 0x4d, 0x80]); // LEA RCX, [RBP-0x80]
+        tramp.absolute_call(detour_paid_hire_extra as *const ());
+        tramp.bytes(&[0x89, 0x44, 0x24, 0x74]); // MOV [RSP+0x74], EAX
+        tramp.absolute_jump(site + 8);
+        session
+            .detour_trampoline(site, 8, tramp)
+            .map_err(|e| e.to_string())?;
+        installed += 1;
+    }
+    Ok(installed)
+}
+
+/// # Safety
 /// `module` must be the loaded Steam 1.163 executable during mod initialization.
 /// The guard covers the native prologue; pool ID is in R8D and budget in XMM1
 /// (see the [spawn ABI audit](https://github.com/mxtrnhf/hf_notes/blob/master/docs/findings/strategy/enemy-ship-pools.md#11-real-abi-registerstack-verified)).
@@ -888,8 +973,8 @@ unsafe fn run_spawn_ships(
     out_vec: *mut RawStringVec,
     budget: f32,
     pool_id: i32,
-    chance_a: f32,
-    chance_b: f32,
+    mut chance_a: f32,
+    mut chance_b: f32,
     any_size: bool,
 ) {
     if out_vec.is_null() {
@@ -913,7 +998,62 @@ unsafe fn run_spawn_ships(
         _ => &[],
     };
     append_budgeted_city_roster(out_vec, entries, budget, any_size);
-    append_tactical_packages(out_vec, pools, is_city_garrison, chance_a, chance_b);
+    if is_city_garrison {
+        if let Some(op) = pools.tactical_air_count_op {
+            chance_a = op.apply_float(chance_a);
+        }
+        if let Some(op) = pools.tactical_missile_count_op {
+            chance_b = op.apply_float(chance_b);
+        }
+    }
+    append_tactical_packages(out_vec, pools, chance_a, chance_b, false);
+}
+
+unsafe extern "C" fn detour_native_tactical_packages(
+    out_vec: *mut RawStringVec,
+    chance_a: f32,
+    chance_b: f32,
+) {
+    if catch_unwind(AssertUnwindSafe(|| {
+        if let Some(pools) = RESOLVED_POOLS.get() {
+            // SAFETY: R15 at 0x205906 is the caller's aligned, initialized
+            // output vector, exclusively lent on the game thread.
+            append_tactical_packages(out_vec, pools, chance_a, chance_b, true);
+        }
+    }))
+    .is_err()
+    {
+        report_hook_panic("native tactical packages");
+    }
+}
+
+unsafe extern "C" fn detour_paid_hire_extra(out_vec: *mut RawStringVec) -> usize {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let Some(extra) = RESOLVED_POOLS
+            .get()
+            .and_then(|pools| pools.hire_extra.as_ref())
+        else {
+            return NATIVE_HIRE_OFFER_CAP;
+        };
+        let escorts = roll_extra_escorts(extra);
+        if escorts.is_empty() {
+            return NATIVE_HIRE_OFFER_CAP;
+        }
+        // SAFETY: At 0x2a8347 the paid city caller lends its initialized,
+        // aligned draft vector. Only names beyond the original five-offer
+        // cap are discarded; the caller still owns the backing buffer.
+        let original_offers = game_string_vec_len(out_vec).min(NATIVE_HIRE_OFFER_CAP);
+        truncate_game_string_vec(out_vec, original_offers);
+        let limit = original_offers + escorts.len();
+        append_roster_names(out_vec, escorts);
+        limit
+    })) {
+        Ok(limit) => limit,
+        Err(_) => {
+            report_hook_panic("mercs.extra_escort");
+            NATIVE_HIRE_OFFER_CAP
+        }
+    }
 }
 
 /// # Safety
@@ -942,31 +1082,65 @@ unsafe fn append_budgeted_city_roster(
 unsafe fn append_tactical_packages(
     out_vec: *mut RawStringVec,
     pools: &ResolvedPools,
-    is_city_garrison: bool,
-    mut air_chance: f32,
-    mut missile_chance: f32,
+    air_chance: f32,
+    missile_chance: f32,
+    native_draft: bool,
 ) {
-    if is_city_garrison {
-        if let Some(op) = pools.tactical_air_count_op {
-            air_chance = op.apply_float(air_chance);
-        }
-        if let Some(op) = pools.tactical_missile_count_op {
-            missile_chance = op.apply_float(missile_chance);
-        }
-    }
-
     // Both draws are made even for callers that pass zero chances.
+    let before_air = game_string_vec_len(out_vec);
     if hge_rand_float(0.0, 1.0) < air_chance && !pools.tactical_air.is_empty() {
         if let Some(bounds) = pools.tactical_air_ship_count {
             let target = roll_size(bounds);
             let carriers = available_designs(&pools.tactical_air);
             append_random_designs(out_vec, &carriers, target);
+        } else if native_draft {
+            // `0x20592b`: native air adds Longbow without another RNG draw.
+            push_game_string(out_vec, c"Longbow".as_ptr());
         } else if let Some(carrier) = pick_design(&pools.tactical_air) {
             push_game_string(out_vec, carrier.c_name.as_ptr());
         }
     }
+    let before_missile = game_string_vec_len(out_vec);
     if hge_rand_float(0.0, 1.0) < missile_chance {
         append_tactical_missile_package(out_vec, pools);
+    }
+    let missile_spawned = game_string_vec_len(out_vec) > before_missile;
+
+    // Roll escorts after both core packages. Air extra rolls must not change
+    // whether the same city gets its normal missile group.
+    if before_missile > before_air {
+        append_extra_escorts(out_vec, pools.tactical_air_extra.as_ref());
+    }
+    if missile_spawned {
+        append_extra_escorts(out_vec, pools.tactical_missile_extra.as_ref());
+    }
+}
+
+/// # Safety
+/// Call on the game thread with a live design library and HGE RNG. Only
+/// Rust-owned names are returned; missing native designs are not candidates.
+unsafe fn roll_extra_escorts(extra: &ExtraEscortPool) -> Vec<&PoolEntry> {
+    let candidates = available_designs(&extra.entries);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    (0..extra.count)
+        .filter_map(|_| {
+            if extra.chance == 1.0 || f64::from(hge_rand_float(0.0, 1.0)) < extra.chance {
+                pick_design(&candidates).copied()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// # Safety
+/// Call on the game thread with a live design library and an initialized,
+/// aligned native string vector exclusively writable by this call.
+unsafe fn append_extra_escorts(out_vec: *mut RawStringVec, extra: Option<&ExtraEscortPool>) {
+    if let Some(extra) = extra {
+        append_roster_names(out_vec, roll_extra_escorts(extra));
     }
 }
 
@@ -1074,6 +1248,21 @@ unsafe extern "C" fn detour_build_strikegroup(
     }
 }
 
+unsafe extern "C" fn detour_native_strikegroup_extra(names: *mut RawStringVec) {
+    if catch_unwind(AssertUnwindSafe(|| {
+        if let Some(pools) = RESOLVED_POOLS.get() {
+            // SAFETY: At 0x2085c7 the native game-thread builder exclusively
+            // lends its aligned, initialized roster before passing it to the
+            // fleet constructor. The builder retains ownership.
+            append_extra_escorts(names, pools.strikegroup_extra.as_ref());
+        }
+    }))
+    .is_err()
+    {
+        report_hook_panic("strikegroups.extra_escort");
+    }
+}
+
 /// # Safety
 /// The game thread must have a live profile and design library. `spawn_pos`
 /// must point to a readable, aligned `Vec2`, and `escadra_name` to a readable
@@ -1155,6 +1344,7 @@ unsafe fn build_budgeted_strikegroup_roster(
     if include_khiva_hull {
         append_roster_names(&mut names, pick_design(&pools.sg_extra_khiva));
     }
+    append_extra_escorts(&mut names, pools.strikegroup_extra.as_ref());
     names
 }
 

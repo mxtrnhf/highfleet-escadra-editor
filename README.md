@@ -2,7 +2,7 @@
 
 HEE lets you edit every hard-coded ship spawn pool in HighFleet (**Steam 1.163 only**) from one file: `Modloader/config/escadra.json`.
 
-Untouched pools stay completely unhooked. Pools you edit install byte-verified detours at startup.
+HEE installs the hooks it needs at startup. A hook shared by several pools can still run when another pool is edited.
 
 ---
 
@@ -62,16 +62,47 @@ To avoid copying long ship lists across multiple pools:
 
 | Pool | What it controls | Optional sub-fields |
 |---|---|---|
-| `strikegroups` | Roaming & endgame Strike Groups | `flagships_normal`, `flagships_hard`, `fill_normal`, `fill_hard`, `missile_escorts`, `carrier_escorts`, `khiva_extra`, `endgame_rider`, `count`, `budget`, `sprinkle` |
-| `tactical_air` | City aircraft tactical groups & SG carrier escorts | `count`, `ship_count` |
-| `tactical_missile` | City missile tactical groups & SG missile riders | `ships`, `escorts`, `sg_missile`, `endgame_rider`, `count`, `ship_count` |
+| `strikegroups` | Roaming & endgame Strike Groups | `flagships_normal`, `flagships_hard`, `fill_normal`, `fill_hard`, `missile_escorts`, `carrier_escorts`, `khiva_extra`, `endgame_rider`, `count`, `budget`, `sprinkle`, `extra_escort` |
+| `tactical_air` | City aircraft tactical groups & SG carrier escorts | `count`, `ship_count`, `extra_escort` |
+| `tactical_missile` | City missile tactical groups & SG missile riders | `ships`, `escorts`, `sg_missile`, `endgame_rider`, `count`, `ship_count`, `extra_escort` |
 | `garrisons` | City garrisons (campaign & Nuclear War) | `campaign`, `endgame`, `city_budget_multiplier`, `include_in_shipworks` *(bool, mirrors roster edits into `shipworks`)* |
 | `tarkhans` | Named Tarkhan personal ships & Khiva finale flagships | `campaign`, `tier0`, `tier1`, `tier2`, `tier3`, `tier4` |
-| `mercs` | Mercenary `FOR_HIRE`, Nuclear War `FOR_JOIN`, `ASK_REINFORCE` | `hire`, `city_budget_multiplier` (paid stock only), `endgame`, `reinforcements`, `reinforcements_tier0` |
+| `mercs` | Mercenary `FOR_HIRE`, Nuclear War `FOR_JOIN`, `ASK_REINFORCE` | `hire`, `city_budget_multiplier` (paid stock only), `endgame`, `reinforcements`, `reinforcements_tier0`, `extra_escort` (paid stock only) |
 | `traders` | Trade Convoys *(flat `add`/`remove` edits escorts safely)* | `ships` *(prize hulls, auto-marked capturable `m_prize = 1`)*, `escorts`, `escorts_hard`, `count` |
 | `shipworks` | Shipworks `TEST` combat opponents *(flat `add` auto-classifies by stats)* | `small`, `mid`, `large`, `carrier` |
 
-When a sub-field is omitted, the category's top-level `replace`/`remove`/`add` applies. When specified, that sub-field overrides it.
+Where a roster sub-pool supports top-level inheritance, its own `replace`/`remove`/`add` overrides the category's edits. `extra_escort` is always a separate pool, not a roster override.
+
+---
+
+## Extra escorts (`extra_escort`)
+
+Use `extra_escort` to add hulls **on top of** a normal roster, without putting them into its draft pool or charging them against its budget. For example, this adds up to three Hounds to a city Air Tactical package without putting Hounds into the carrier pool:
+
+```json
+{
+  "tactical_air": {
+    "extra_escort": { "add": ["Hound"], "count": 3, "chance": 0.1 }
+  }
+}
+```
+
+* `add`: a list of ship designs. Bare names, custom designs, `@groups`, and wildcards work as in other `add` lists. Missing designs are skipped. Repeating a name increases its draw weight.
+* `count`: a JSON integer from `0` to `32`, **not a string**. This is the number of attempts per eligible spawn, not a group count.
+* `chance`: a JSON number from `0` to `1` **per attempt**. In this example the game rolls three times at 10% each, for zero to three escorts. Each success draws one ship from the same list, so ships can repeat. Set `chance` to `1` to guarantee each attempt if at least one design is available.
+
+Omit the field, use zero attempts or chance, or leave `add` empty to disable it. A malformed entry is logged and ignored without resetting the rest of the config.
+
+Put `extra_escort` directly under one of these sections:
+
+| Parent section | When it adds ships |
+|---|---|
+| `tactical_air` | Only when a city Air Tactical package adds its base ship(s). Does not change the carrier pool, `ship_count`, or Strike Group carrier escorts. |
+| `tactical_missile` | Only when a city Missile Tactical package adds its base ship(s). Does not change `ship_count` or Strike Group missile riders. |
+| `strikegroups` | Once for each spawned roaming, Khiva assault, or outer Nuclear War Strike Group. Vanilla escorts and the late missile rider are separate. |
+| `mercs` | Once per paid Mercenary city stock roll. Keeps the normal zero to five offers, then adds the successful picks as extra `FOR_HIRE` stock, even if the normal budget is zero. Put it under `mercs`, not under `hire`. Free `FOR_JOIN` stock and Tarkhan reinforcements are unchanged. |
+
+These settings only affect future generation. They do not add ships to rosters already stored in a save.
 
 ---
 
@@ -144,7 +175,7 @@ Use a nonnegative JSON number to multiply each city's own vanilla draft budget. 
 ```
 
 * **Garrisons:** scales only the base roster. A multiplier of `0` stops that draft but leaves the tactical package chances unchanged.
-* **Paid mercenaries (`FOR_HIRE`):** scales only the paid stock, which still has a **five-offer cap** per mercenary city. A multiplier of `0` produces no paid offers. Free `FOR_JOIN` ships and reinforcements are unaffected. `mercs.city_budget_multiplier` is shorthand; a valid `mercs.hire.city_budget_multiplier` takes precedence (`for_hire` is an alias for `hire`).
+* **Paid mercenaries (`FOR_HIRE`):** scales only the normal paid stock, capped at **five standard offers** per mercenary city. A multiplier of `0` skips the normal draft but still allows `mercs.extra_escort` offers. Free `FOR_JOIN` ships and reinforcements are unaffected. `mercs.city_budget_multiplier` is shorthand; a valid `mercs.hire.city_budget_multiplier` takes precedence (`for_hire` is an alias for `hire`).
 
 When upgrading from v0.8.0, replace any flat `budget` under `garrisons` or `mercs`/`mercs.hire`; those keys are now ignored. There is no direct conversion to a multiplier because the vanilla budget varies by city. Large multipliers can slow down generation and gameplay. See the [Steam 1.163 spawn-pool audit](https://github.com/mxtrnhf/hf_notes/blob/master/docs/findings/strategy/enemy-ship-pools.md) for the native draft and spawn rules.
 
@@ -313,14 +344,15 @@ A full `"this game is mine and I will play with MY ships"` overhaul using
 ## Build & install
 
 * Build: `cargo xwin build --release --target x86_64-pc-windows-msvc`
-* Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`). Latest: `hf_hee_v0.9.0.dll`.
-* Release packs: include `README.md` alongside the DLL so users have the `escadra.json` reference.
+* Install: copy `target/x86_64-pc-windows-msvc/release/hf_hee.dll` to `<game dir>/Modloader/mods/hf_hee_v<version>.dll` (remove older `hf_hee_v*.dll`). Latest: `hf_hee_v0.10.0.dll`.
+* Release packs: include `README.md` and `HEE_Manual.pdf` alongside the DLL so users have the `escadra.json` reference.
 * Config: `Modloader/config/escadra.json` is auto-created on first run if missing. Existing configs load without changes.
 
 ---
 
 ## Changelog
 
+* **v0.10.0**: Added opt-in `extra_escort` pools for city Air and Missile Tactical packages, Strike Groups, and paid Mercenary stock. Extras roll independently of the normal roster budget and slots.
 * **v0.9.0**: Replaced flat city budgets with separate `city_budget_multiplier` settings for garrisons and paid `FOR_HIRE` stock, preserving vanilla city progression.
 * **v0.8.0**: Replaced `ship_count` with `budget` for Strike Groups, garrisons, and paid mercenary stock. Tactical packages still use `ship_count`. Refactored roster drafting and documented vanilla sizes.
 * **v0.7.0**: Added optional `ship_count` ranges and fixed sizes for Strike Groups, air and missile tactical packages, city garrisons, and paid mercenary stock.
